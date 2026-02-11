@@ -1,4 +1,35 @@
 .env
-
-# test script
+.env.*
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+.cache/
+*.log
+*.tmp
+*.swp
+*.bak
+Thumbs.db
+.DS_Store
+.vscode/
+.idea/
+.claude/
+.trae/
+*.iml
+db/*.db
+db/*.db-journal
+db/*.db-wal
+db/*.db-shm
+temp/
+test sample/
+training_data/
+pdf_extraction_analysis_report.md
 test.py

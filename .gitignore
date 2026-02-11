@@ -22,7 +22,10 @@ Thumbs.db
 .vscode/
 .idea/
 .claude/
-.trae/
+.trae/*
+!.trae/skills/
+!.trae/skills/**
+.trae/documents/
 *.iml
 db/*.db
 db/*.db-journal

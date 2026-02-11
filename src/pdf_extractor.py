@@ -14,13 +14,12 @@ except ImportError:
     sys.path.append(str(Path(__file__).parent))
     from ocr_engine import OCREngine
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class PDFExtractor:
-    def __init__(self):
-        self.ocr_engine = OCREngine()
-        patterns = self.load_patterns()
+    def __init__(self, ocr_engine=None, patterns=None):
+        self.ocr_engine = ocr_engine or OCREngine()
+        patterns = patterns or self.load_patterns()
         self.doc_patterns = patterns['doc_patterns']
         self.field_patterns = patterns['field_patterns']
 
@@ -806,13 +805,14 @@ def process_single_pdf(pdf_path, output_dir=None, extractor=None):
         return Path(pdf_path).name, result
 
 
-def process_pdfs_multithread(pdf_paths, max_workers=4, output_dir=None):
+def process_pdfs_multithread(pdf_paths, max_workers=4, output_dir=None, extractor=None):
     """多线程处理多个PDF文件"""
     results = {}
+    extractor = extractor or PDFExtractor()
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_path = {
-            executor.submit(process_single_pdf, path, output_dir): path
+            executor.submit(process_single_pdf, path, output_dir, extractor): path
             for path in pdf_paths
         }
 

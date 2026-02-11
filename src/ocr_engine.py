@@ -1,6 +1,9 @@
 import logging
+import os
 from pathlib import Path
 import tempfile
+import threading
+import gc
 
 try:
     from paddleocr import PaddleOCR
@@ -20,30 +23,71 @@ try:
 except ImportError:
     HAS_PDF2IMAGE = False
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class OCREngine:
+    _instances = {}
+    _instance_lock = threading.Lock()
+
+    def __new__(cls, use_gpu=False):
+        key = (use_gpu,)
+        with cls._instance_lock:
+            instance = cls._instances.get(key)
+            if instance is None:
+                instance = super().__new__(cls)
+                instance._initialized = False
+                cls._instances[key] = instance
+        return instance
+
     def __init__(self, use_gpu=False):
+        if self._initialized:
+            return
+        self.use_gpu = use_gpu
         self.paddle_model = None
-        if HAS_PADDLE:
+        self._model_lock = threading.Lock()
+        self._ocr_lock = threading.Lock()
+        self._model_init_failed = False
+        self._initialized = True
+        if not HAS_PADDLE:
+            logger.warning("PaddleOCR not installed. OCR capabilities will be limited.")
+
+    def _ensure_paddle_model(self):
+        if not HAS_PADDLE:
+            return False
+        if self._model_init_failed:
+            return False
+        if self.paddle_model:
+            return True
+        with self._model_lock:
+            if self.paddle_model:
+                return True
             try:
-                # Initialize PaddleOCR - 使用兼容的参数
-                # lang='ch' supports both Chinese and English
+                os.environ.setdefault("OMP_NUM_THREADS", "1")
+                os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+                os.environ.setdefault("MKL_NUM_THREADS", "1")
+                os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
                 self.paddle_model = PaddleOCR(use_angle_cls=True, lang='ch')
                 logger.info("PaddleOCR initialized successfully.")
+                return True
             except Exception as e:
                 logger.error(f"Failed to initialize PaddleOCR: {e}")
-        else:
-            logger.warning("PaddleOCR not installed. OCR capabilities will be limited.")
+                self.paddle_model = None
+                self._model_init_failed = True
+                return False
+
+    def release(self):
+        self.paddle_model = None
+        self._model_init_failed = False
+        gc.collect()
 
     def extract_text_from_image(self, image_path):
         """Extract text from image using PaddleOCR"""
-        if not self.paddle_model:
+        if not self._ensure_paddle_model():
             return ""
 
         try:
-            result = self.paddle_model.ocr(str(image_path), cls=True)
+            with self._ocr_lock:
+                result = self.paddle_model.ocr(str(image_path), cls=True)
             text_parts = []
             for page_result in result:
                 if page_result:
@@ -95,8 +139,9 @@ class OCREngine:
                 logger.error(f"pdfplumber failed: {e}")
 
         # Strategy 2: PaddleOCR on images (Scanned PDF / Image-based PDF)
-        if self.paddle_model and HAS_PDF2IMAGE:
+        if HAS_PDF2IMAGE and self._ensure_paddle_model():
             logger.info("pdfplumber yielded little text. Converting PDF to images and performing OCR...")
+            pages = []
             try:
                 pages = self.convert_pdf_to_images(pdf_path)
                 if pages:
@@ -106,12 +151,21 @@ class OCREngine:
                             page.save(temp_img_path, "PNG")
                             page_text = self.extract_text_from_image(temp_img_path)
                             text_content += page_text + "\n"
+                            close_fn = getattr(page, "close", None)
+                            if callable(close_fn):
+                                close_fn()
 
                     if text_content.strip():
                         logger.info("Successfully extracted text using OCR on PDF images.")
                         return text_content
             except Exception as e:
                 logger.error(f"PDF to image conversion and OCR failed: {e}")
+            finally:
+                for page in pages:
+                    close_fn = getattr(page, "close", None)
+                    if callable(close_fn):
+                        close_fn()
+                gc.collect()
         elif not HAS_PDF2IMAGE:
             logger.warning("pdf2image not available. Cannot process image-based PDFs.")
 

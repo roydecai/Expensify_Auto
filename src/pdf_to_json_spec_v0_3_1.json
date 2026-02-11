@@ -1,0 +1,247 @@
+{
+  "spec_name": "pdf_to_json_validity_spec",
+  "spec_version": "0.3.1",
+  "service_entry": "src/pdf_extraction_service.py",
+  "status_model": {
+    "pass": "PASS",
+    "fail_human": "FAIL_HUMAN",
+    "fail_llm": "FAIL_LLM"
+  },
+  "global_rules": {
+    "json_must_parse": {
+      "fail_status": "FAIL_HUMAN",
+      "error_code": "JSON_PARSE_ERROR"
+    },
+    "root_must_be_object": {
+      "fail_status": "FAIL_HUMAN",
+      "error_code": "ROOT_NOT_OBJECT"
+    },
+    "document_type_enum": {
+      "allowed": [
+        "VAT_invoice",
+        "bank_receipt",
+        "tax_certificate",
+        "unknown"
+      ],
+      "fail_status": "FAIL_LLM",
+      "error_code": "DOC_TYPE_INVALID"
+    },
+    "document_type_unknown_is_human": {
+      "value": "unknown",
+      "fail_status": "FAIL_HUMAN",
+      "error_code": "DOC_TYPE_UNKNOWN"
+    },
+    "extracted_text_trim_nonempty": {
+      "fail_status": "FAIL_HUMAN",
+      "error_code": "EXTRACTED_TEXT_EMPTY"
+    },
+    "warnings": {
+      "text_too_short": {
+        "field": "extracted_text",
+        "threshold_len": 50,
+        "warning_code": "TEXT_TOO_SHORT"
+      }
+    }
+  },
+  "field_rules": {
+    "date": {
+      "type": "string",
+      "trim_nonempty": true,
+      "regex": "^\\d{4}-\\d{2}-\\d{2}$",
+      "range_days_relative_to_today": {
+        "past_days": 450,
+        "future_days": 45
+      },
+      "error_codes": {
+        "missing": "REQUIRED_FIELD_MISSING",
+        "empty": "REQUIRED_FIELD_EMPTY",
+        "format": "DATE_FORMAT_INVALID",
+        "out_of_range": "DATE_OUT_OF_RANGE"
+      }
+    },
+    "amount_like": {
+      "type": "string",
+      "trim_nonempty": true,
+      "regex": "^\\d+(\\.\\d{2})$",
+      "error_codes": {
+        "missing": "REQUIRED_FIELD_MISSING",
+        "empty": "REQUIRED_FIELD_EMPTY",
+        "format": "AMOUNT_FORMAT_INVALID"
+      }
+    },
+    "uid": {
+      "type": "string",
+      "trim_nonempty": true,
+      "regex": "^[A-Za-z0-9]{8,30}$",
+      "error_codes": {
+        "missing": "REQUIRED_FIELD_MISSING",
+        "empty": "REQUIRED_FIELD_EMPTY",
+        "format": "UID_FORMAT_INVALID"
+      }
+    },
+    "name_like": {
+      "type": "string",
+      "trim_nonempty": true,
+      "length": {
+        "min": 2,
+        "max": 80
+      },
+      "char_policy": {
+        "allow_parentheses": true,
+        "allowed_parentheses_pairs": [
+          "()",
+          "（）"
+        ],
+        "allow_whitespace_inside_parentheses": true,
+        "disallow_whitespace_outside_parentheses": true,
+        "disallow_quotes_anywhere": true,
+        "disallow_punctuation_except_parentheses": true,
+        "require_parentheses_balanced": true,
+        "disallow_parentheses_nesting": true
+      },
+      "error_codes": {
+        "missing": "REQUIRED_FIELD_MISSING",
+        "empty": "REQUIRED_FIELD_EMPTY",
+        "has_quote": "NAME_HAS_QUOTE",
+        "has_punctuation": "NAME_HAS_PUNCTUATION",
+        "ws_outside_parentheses": "NAME_HAS_WHITESPACE_OUTSIDE_BRACKETS",
+        "parentheses_unbalanced": "NAME_BRACKETS_UNBALANCED"
+      },
+      "warning_codes": {
+        "noise_keywords": "NAME_NOISE_KEYWORDS",
+        "length_suspicious": "NAME_LENGTH_SUSPICIOUS",
+        "mostly_numeric": "NAME_MOSTLY_NUMERIC"
+      }
+    },
+    "currency": {
+      "type": "string",
+      "trim_nonempty": true,
+      "allowed": [
+        "CNY",
+        "USD",
+        "HKD",
+        "SGD",
+        "EUR",
+        "JPY"
+      ],
+      "error_codes": {
+        "missing": "REQUIRED_FIELD_MISSING",
+        "empty": "REQUIRED_FIELD_EMPTY",
+        "invalid": "CURRENCY_INVALID"
+      }
+    },
+    "tax_id": {
+      "type": "string",
+      "trim_nonempty": true,
+      "regex": "^[0-9A-Z]{8,20}$",
+      "conditional_rules": [
+        {
+          "when": {
+            "related_name_script": "cjk_only"
+          },
+          "then": {
+            "regex": "^[0-9A-Z]{18}$",
+            "fail_status": "FAIL_LLM",
+            "error_code": "TAX_ID_CJK_NAME_MUST_BE_18"
+          }
+        }
+      ],
+      "error_codes": {
+        "missing": "REQUIRED_FIELD_MISSING",
+        "empty": "REQUIRED_FIELD_EMPTY",
+        "format": "TAX_ID_FORMAT_INVALID"
+      }
+    }
+  },
+  "document_schemas": {
+    "VAT_invoice": {
+      "required_fields": [
+        "document_type",
+        "extracted_text",
+        "payer",
+        "seller",
+        "buyer_tax_id",
+        "seller_tax_id",
+        "project_name",
+        "date",
+        "currency",
+        "uid",
+        "total_amount",
+        "tax_amount"
+      ],
+      "optional_fields": [],
+      "field_bindings": {
+        "payer": "name_like",
+        "seller": "name_like",
+        "project_name": "name_like",
+        "buyer_tax_id": {
+          "rule": "tax_id",
+          "related_name_field": "payer"
+        },
+        "seller_tax_id": {
+          "rule": "tax_id",
+          "related_name_field": "seller"
+        },
+        "date": "date",
+        "currency": "currency",
+        "uid": "uid",
+        "total_amount": "amount_like",
+        "tax_amount": "amount_like"
+      }
+    },
+    "bank_receipt": {
+      "required_fields": [
+        "document_type",
+        "extracted_text",
+        "payer",
+        "payee",
+        "date",
+        "currency",
+        "uid",
+        "amount"
+      ],
+      "optional_fields": [],
+      "field_bindings": {
+        "payer": "name_like",
+        "payee": "name_like",
+        "date": "date",
+        "currency": "currency",
+        "uid": "uid",
+        "amount": "amount_like"
+      }
+    },
+    "tax_certificate": {
+      "required_fields": [
+        "document_type",
+        "extracted_text",
+        "payer",
+        "payer_tax_id",
+        "date",
+        "currency",
+        "uid",
+        "amount"
+      ],
+      "optional_fields": [
+        {
+          "field": "tax_authority",
+          "when_missing": {
+            "severity": "warning",
+            "code": "MISSING_OPTIONAL"
+          }
+        }
+      ],
+      "field_bindings": {
+        "payer": "name_like",
+        "payer_tax_id": {
+          "rule": "tax_id",
+          "related_name_field": "payer"
+        },
+        "tax_authority": "name_like",
+        "date": "date",
+        "currency": "currency",
+        "uid": "uid",
+        "amount": "amount_like"
+      }
+    }
+  }
+}

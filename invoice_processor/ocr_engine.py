@@ -4,6 +4,7 @@ from pathlib import Path
 import tempfile
 import threading
 import gc
+from typing import Any, List, Union
 
 try:
     from paddleocr import PaddleOCR
@@ -29,7 +30,7 @@ class OCREngine:
     _instances = {}
     _instance_lock = threading.Lock()
 
-    def __new__(cls, use_gpu=False):
+    def __new__(cls, use_gpu: bool = False):
         key = (use_gpu,)
         with cls._instance_lock:
             instance = cls._instances.get(key)
@@ -39,7 +40,7 @@ class OCREngine:
                 cls._instances[key] = instance
         return instance
 
-    def __init__(self, use_gpu=False):
+    def __init__(self, use_gpu: bool = False) -> None:
         if self._initialized:
             return
         self.use_gpu = use_gpu
@@ -51,7 +52,7 @@ class OCREngine:
         if not HAS_PADDLE:
             logger.warning("PaddleOCR not installed. OCR capabilities will be limited.")
 
-    def _ensure_paddle_model(self):
+    def _ensure_paddle_model(self) -> bool:
         if not HAS_PADDLE:
             return False
         if self._model_init_failed:
@@ -75,12 +76,12 @@ class OCREngine:
                 self._model_init_failed = True
                 return False
 
-    def release(self):
+    def release(self) -> None:
         self.paddle_model = None
         self._model_init_failed = False
         gc.collect()
 
-    def extract_text_from_image(self, image_path):
+    def extract_text_from_image(self, image_path: Union[str, Path]) -> str:
         """Extract text from image using PaddleOCR"""
         if not self._ensure_paddle_model():
             return ""
@@ -99,7 +100,7 @@ class OCREngine:
             logger.error(f"OCR on image failed: {e}")
             return ""
 
-    def convert_pdf_to_images(self, pdf_path):
+    def convert_pdf_to_images(self, pdf_path: Union[str, Path]) -> List[Any]:
         """Convert PDF to list of PIL Images"""
         if not HAS_PDF2IMAGE:
             logger.warning("pdf2image not installed. Cannot convert PDF to images for OCR.")
@@ -113,7 +114,7 @@ class OCREngine:
             logger.error(f"Failed to convert PDF to images: {e}")
             return []
 
-    def extract_text(self, pdf_path):
+    def extract_text(self, pdf_path: Union[str, Path]) -> str:
         """
         Extract text from PDF. Tries multiple strategies:
         1. pdfplumber (fast, good for digital PDFs)

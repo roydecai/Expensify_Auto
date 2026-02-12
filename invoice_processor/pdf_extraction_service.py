@@ -3,9 +3,12 @@ import gc
 import json
 import logging
 import os
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
+from config import get_company_db_path, get_project_root
 from ocr_engine import OCREngine
 from pdf_extractor import PDFExtractor
 
@@ -15,25 +18,55 @@ def configure_logging(level=logging.INFO):
 
 
 class PDFExtractionService:
-    def __init__(self, use_gpu=False, log_level=logging.INFO):
+    def __init__(self, use_gpu: bool = False, log_level: int = logging.INFO) -> None:
         configure_logging(log_level)
         self.logger = logging.getLogger(__name__)
         self.ocr_engine = OCREngine(use_gpu=use_gpu)
         self.patterns = self._load_patterns()
-        self.extractor = PDFExtractor(ocr_engine=self.ocr_engine, patterns=self.patterns)
+        self.company_records = self._load_company_records()
+        self.extractor = PDFExtractor(
+            ocr_engine=self.ocr_engine,
+            patterns=self.patterns,
+            company_records=self.company_records,
+        )
 
-    def _load_patterns(self):
+    def _load_patterns(self) -> Dict[str, Any]:
         patterns_path = Path(__file__).with_name("patterns.json")
         with open(patterns_path, "r", encoding="utf-8") as f:
             return json.load(f)
 
-    def _resolve_output_dir(self, output_dir):
+    def _resolve_output_dir(self, output_dir: Optional[str]) -> Path:
         if output_dir is None:
-            project_root = Path(__file__).parent.parent
-            return project_root / "temp"
+            return get_project_root() / "temp"
         return Path(output_dir)
 
-    def process_pdf(self, pdf_path, output_dir=None):
+    def _load_company_records(self) -> List[Dict[str, Optional[str]]]:
+        db_path = get_company_db_path()
+        if not db_path.exists():
+            return []
+        try:
+            conn = sqlite3.connect(str(db_path))
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT payer_tax_id, full_name, short_name, eng_full_name, eng_short_name FROM companies"
+            )
+            rows = cursor.fetchall()
+        finally:
+            conn.close()
+        records: List[Dict[str, Optional[str]]] = []
+        for row in rows:
+            records.append(
+                {
+                    "payer_tax_id": row[0],
+                    "full_name": row[1],
+                    "short_name": row[2],
+                    "eng_full_name": row[3],
+                    "eng_short_name": row[4],
+                }
+            )
+        return records
+
+    def process_pdf(self, pdf_path: Union[str, Path], output_dir: Optional[str] = None) -> Tuple[str, Dict[str, Any]]:
         pdf_path = Path(pdf_path)
         target_dir = self._resolve_output_dir(output_dir)
         target_dir.mkdir(parents=True, exist_ok=True)
@@ -52,8 +85,13 @@ class PDFExtractionService:
         finally:
             gc.collect()
 
-    def process_pdfs_multithread(self, pdf_paths, max_workers=4, output_dir=None):
-        results = {}
+    def process_pdfs_multithread(
+        self,
+        pdf_paths: Iterable[Path],
+        max_workers: int = 4,
+        output_dir: Optional[str] = None,
+    ) -> Dict[str, Dict[str, Any]]:
+        results: Dict[str, Dict[str, Any]] = {}
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_path = {
                 executor.submit(self.process_pdf, path, output_dir): path
@@ -64,14 +102,16 @@ class PDFExtractionService:
                 results[filename] = result
         return results
 
-    def process_pdfs_sequentially(self, pdf_paths, output_dir=None):
-        results = {}
+    def process_pdfs_sequentially(
+        self, pdf_paths: Iterable[Path], output_dir: Optional[str] = None
+    ) -> Dict[str, Dict[str, Any]]:
+        results: Dict[str, Dict[str, Any]] = {}
         for pdf_path in pdf_paths:
             filename, result = self.process_pdf(pdf_path, output_dir)
             results[filename] = result
         return results
 
-    def close(self):
+    def close(self) -> None:
         self.ocr_engine.release()
         gc.collect()
 

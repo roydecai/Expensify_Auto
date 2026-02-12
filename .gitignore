@@ -36,3 +36,4 @@ test sample/
 training_data/
 pdf_extraction_analysis_report.md
 test.py
+invoice_to_proceed/

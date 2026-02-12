@@ -50,10 +50,12 @@ class DBManager:
                     main_bank TEXT,
                     main_bank_account TEXT,
                     tax_authority TEXT,
+                    expensify_policyID TEXT,
                     update_date TEXT
                 )
             ''')
             self._add_missing_columns(conn, 'companies', [
+                ('expensify_policyID', 'TEXT'),
                 ('update_date', 'TEXT')
             ])
             conn.commit()

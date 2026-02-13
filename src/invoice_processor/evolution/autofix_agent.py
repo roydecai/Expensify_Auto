@@ -1,18 +1,103 @@
 import argparse
+import importlib
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterable, List, Optional
 
 from config import get_default_model_id, get_project_root
-from main import _create_ark_client, _extract_json_from_response, _load_ark_settings
 from pdf_extraction_service import PDFExtractionService
 from pdf_json_validator import load_spec, validate_dir
 
 from evolution.pattern_mutator import PatternMutator
 from evolution.regression_runner import run_regression
 from evolution.safe_executor import SafeFileExecutor
+
+
+def load_dotenv() -> None:
+    try:
+        mod = importlib.import_module("dotenv")
+        maybe = getattr(mod, "load_dotenv", None)
+        if callable(maybe):
+            maybe()
+    except Exception:
+        return None
+
+
+def _collect_strings(payload: Any) -> Iterable[str]:
+    if isinstance(payload, str):
+        yield payload
+        return
+    if isinstance(payload, dict):
+        for value in payload.values():
+            yield from _collect_strings(value)
+        return
+    if isinstance(payload, list):
+        for value in payload:
+            yield from _collect_strings(value)
+
+
+def _parse_json_from_text(text: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(text, str):
+        return None
+    raw = text.strip()
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        snippet = raw[start : end + 1]
+        try:
+            parsed = json.loads(snippet)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            return None
+    return None
+
+
+def _coerce_response_payload(resp: Any) -> Any:
+    if isinstance(resp, (dict, list, str)):
+        return resp
+    for attr in ("model_dump", "to_dict", "dict"):
+        if hasattr(resp, attr):
+            try:
+                return getattr(resp, attr)()
+            except Exception:
+                continue
+    return resp
+
+
+def _extract_json_from_response(resp: Any) -> Optional[Dict[str, Any]]:
+    payload = _coerce_response_payload(resp)
+    for text in _collect_strings(payload):
+        parsed = _parse_json_from_text(text)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _load_ark_settings(default_model: str) -> Dict[str, str]:
+    load_dotenv()
+    base_url = os.getenv("ARK_BASE_URL") or "https://ark.cn-beijing.volces.com/api/v3"
+    api_key = os.getenv("ARK_API_KEY") or ""
+    model = os.getenv("ARK_MODEL") or default_model
+    return {"base_url": base_url, "api_key": api_key, "model": model}
+
+
+def _create_ark_client(base_url: str, api_key: str) -> Any:
+    mod = importlib.import_module("volcenginesdkarkruntime")
+    ark_cls = getattr(mod, "Ark", None)
+    if not callable(ark_cls):
+        raise RuntimeError("volcenginesdkarkruntime.Ark 不可用")
+    return ark_cls(base_url=base_url, api_key=api_key)
 
 
 def _load_mutations(path: Path) -> List[Dict[str, Any]]:
@@ -196,6 +281,87 @@ def _generate_llm_mutations(
     return unique[:max_mutations]
 
 
+def run_autofix(
+    input_path: Path,
+    *,
+    mutations_path: Optional[Path] = None,
+    samples_dir: Optional[Path] = None,
+    spec_path: Optional[Path] = None,
+    patterns_path: Optional[Path] = None,
+    output_dir: Optional[Path] = None,
+    max_rounds: int = 1,
+    model: str = get_default_model_id(),
+    llm_max_cases: int = 3,
+    llm_max_mutations: int = 3,
+    llm_preview_len: int = 800,
+    use_llm: bool = True,
+    run_quality_checks: bool = True,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    project_root = get_project_root()
+    output_dir = output_dir or (project_root / "temp" / "autofix")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    spec_path = (
+        spec_path
+        if spec_path
+        else project_root / "src" / "invoice_processor" / "pdf_to_json_spec_v0_3_1.json"
+    )
+    patterns_path = (
+        patterns_path
+        if patterns_path
+        else project_root / "src" / "invoice_processor" / "patterns.json"
+    )
+
+    spec = load_spec(spec_path)
+    json_dir = _resolve_json_dir(input_path, output_dir)
+    base_summary, base_reports = validate_dir(json_dir, spec)
+
+    mutator = PatternMutator(patterns_path)
+    executor = SafeFileExecutor(allowed_roots=[patterns_path.parent])
+
+    for idx in range(max_rounds):
+        run_id = executor.create_run_id()
+        mutations: List[Dict[str, Any]] = []
+        if mutations_path:
+            mutations.extend(_load_mutations(mutations_path))
+        if use_llm:
+            mutations.extend(
+                _generate_llm_mutations(
+                    base_reports,
+                    model=model,
+                    max_cases=llm_max_cases,
+                    max_mutations=llm_max_mutations,
+                    preview_len=llm_preview_len,
+                )
+            )
+        if not mutations:
+            return {"status": "no_mutations", "round": idx + 1}
+        patterns = mutator.load()
+        for mutation in mutations:
+            patterns = mutator.apply_mutation(patterns, mutation)
+        executor.apply_json(patterns_path, patterns, run_id)
+        if run_quality_checks:
+            if not _run_quality_checks(project_root):
+                executor.restore(run_id)
+                return {"status": "quality_failed", "round": idx + 1}
+        if samples_dir:
+            regression = run_regression(Path(samples_dir), workers=1)
+            if regression.get("failed", 0) > 0:
+                executor.restore(run_id)
+                return {"status": "regression_failed", "round": idx + 1, "regression": regression}
+        next_summary, next_reports = validate_dir(json_dir, spec)
+        improved = _is_improved(base_summary, next_summary)
+        if dry_run or not improved:
+            executor.restore(run_id)
+            status = "dry_run" if dry_run else "not_improved"
+            return {"status": status, "round": idx + 1, "summary": next_summary}
+        base_summary = next_summary
+        base_reports = next_reports
+        if idx == max_rounds - 1:
+            return {"status": "applied", "round": idx + 1, "summary": base_summary}
+    return {"status": "skipped", "summary": base_summary}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("input_path")
@@ -216,74 +382,37 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    project_root = get_project_root()
-    input_path = Path(args.input_path)
-    output_dir = Path(args.output_dir) if args.output_dir else (project_root / "temp" / "autofix")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    spec_path = (
-        Path(args.spec_path)
-        if args.spec_path
-        else project_root / "src" / "invoice_processor" / "pdf_to_json_spec_v0_3_1.json"
+    result = run_autofix(
+        Path(args.input_path),
+        mutations_path=Path(args.mutations_path) if args.mutations_path else None,
+        samples_dir=Path(args.samples_dir) if args.samples_dir else None,
+        spec_path=Path(args.spec_path) if args.spec_path else None,
+        patterns_path=Path(args.patterns_path) if args.patterns_path else None,
+        output_dir=Path(args.output_dir) if args.output_dir else None,
+        max_rounds=args.max_rounds,
+        model=args.model,
+        llm_max_cases=args.llm_max_cases,
+        llm_max_mutations=args.llm_max_mutations,
+        llm_preview_len=args.llm_preview_len,
+        use_llm=args.use_llm,
+        run_quality_checks=args.run_quality_checks,
+        dry_run=args.dry_run,
     )
-    patterns_path = (
-        Path(args.patterns_path)
-        if args.patterns_path
-        else project_root / "src" / "invoice_processor" / "patterns.json"
-    )
-    mutations_path = Path(args.mutations_path) if args.mutations_path else None
-
-    spec = load_spec(spec_path)
-    json_dir = _resolve_json_dir(input_path, output_dir)
-    base_summary, base_reports = validate_dir(json_dir, spec)
-
-    mutator = PatternMutator(patterns_path)
-    executor = SafeFileExecutor(allowed_roots=[patterns_path.parent])
-
-    for idx in range(args.max_rounds):
-        run_id = executor.create_run_id()
-        mutations: List[Dict[str, Any]] = []
-        if mutations_path:
-            mutations.extend(_load_mutations(mutations_path))
-        if args.use_llm:
-            mutations.extend(
-                _generate_llm_mutations(
-                    base_reports,
-                    model=args.model,
-                    max_cases=args.llm_max_cases,
-                    max_mutations=args.llm_max_mutations,
-                    preview_len=args.llm_preview_len,
-                )
-            )
-        if not mutations:
-            print("未生成任何规则变更")
-            break
-        patterns = mutator.load()
-        for mutation in mutations:
-            patterns = mutator.apply_mutation(patterns, mutation)
-        executor.apply_json(patterns_path, patterns, run_id)
-        if args.run_quality_checks:
-            if not _run_quality_checks(project_root):
-                executor.restore(run_id)
-                print("质量检查失败，已回滚")
-                break
-        regression = None
-        if args.samples_dir:
-            regression = run_regression(Path(args.samples_dir), workers=1)
-            if regression.get("failed", 0) > 0:
-                executor.restore(run_id)
-                print("回归失败，已回滚")
-                break
-        next_summary, next_reports = validate_dir(json_dir, spec)
-        improved = _is_improved(base_summary, next_summary)
-        if args.dry_run or not improved:
-            executor.restore(run_id)
-            status = "干跑回滚" if args.dry_run else "效果未提升，已回滚"
-            print(status)
-            break
-        base_summary = next_summary
-        base_reports = next_reports
-        if idx == args.max_rounds - 1:
-            print("修正完成")
+    status = result.get("status")
+    if status == "no_mutations":
+        print("未生成任何规则变更")
+    elif status == "quality_failed":
+        print("质量检查失败，已回滚")
+    elif status == "regression_failed":
+        print("回归失败，已回滚")
+    elif status == "dry_run":
+        print("干跑回滚")
+    elif status == "not_improved":
+        print("效果未提升，已回滚")
+    elif status == "applied":
+        print("修正完成")
+    else:
+        print("自动修正结束")
 
 
 if __name__ == "__main__":

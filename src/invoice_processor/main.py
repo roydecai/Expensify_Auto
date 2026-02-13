@@ -21,6 +21,7 @@ from text_utils import (
     normalize_bank_receipt_uid,
     normalize_direction,
 )
+from evolution.autofix_agent import run_autofix
 
 def load_dotenv() -> None:
     try:
@@ -788,6 +789,17 @@ def main() -> None:
                     max(durations),
                 )
 
+        if should_apply_llm and any(report.get("status") == "FAIL_LLM" for report in reports):
+            try:
+                result = run_autofix(
+                    input_path,
+                    spec_path=spec_path,
+                    model=args.model,
+                )
+                logger.info(f"自动迭代结果: {result.get('status')}")
+            except Exception:
+                logger.exception("自动迭代失败")
+
         if should_apply_llm and reports:
             for report in reports:
                 if report.get("status") != "FAIL_LLM":
@@ -913,6 +925,17 @@ def main() -> None:
             if current_error_count >= last_error_count:
                 stalled = True
             last_error_count = current_error_count
+
+        if should_apply_llm and report.get("status") == "FAIL_LLM":
+            try:
+                result = run_autofix(
+                    input_path,
+                    spec_path=spec_path,
+                    model=args.model,
+                )
+                logger.info(f"自动迭代结果: {result.get('status')}")
+            except Exception:
+                logger.exception("自动迭代失败")
 
         if report.get("status") == "FAIL_LLM":
             errors = report.get("errors")

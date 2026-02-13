@@ -252,6 +252,17 @@ def _cleanup_validation_outputs(json_dir: Path) -> None:
             pass
 
 
+def _report_error_count(report: Dict[str, Any]) -> int:
+    errors = report.get("errors")
+    return len(errors) if isinstance(errors, list) else 0
+
+
+def _report_json_filename(report: Dict[str, Any]) -> Optional[str]:
+    ctx = report.get("context", {})
+    json_filename = ctx.get("json_filename") if isinstance(ctx, dict) else None
+    return json_filename if isinstance(json_filename, str) else None
+
+
 def build_fix_prompt_input(
     report: dict,
     json_dir: Path,
@@ -557,36 +568,30 @@ def main() -> None:
         input_path = output_dir
     if input_path.is_dir():
         summary, reports = validate_dir(input_path, spec, extracted_text_preview_len=args.preview_len)
+        reports = _apply_company_consistency_checks(input_path, reports, company_records)
+        summary = _rebuild_summary(spec.get("spec_version"), input_path, reports)
 
-        fix_inputs = []
-        for report in reports:
-            if report.get("status") != "FAIL_LLM":
-                continue
-            json_filename = report.get("context", {}).get("json_filename")
-            if not isinstance(json_filename, str):
-                continue
-            fix_input = build_fix_prompt_input(
-                report,
-                input_path,
-                spec,
-                spec_path=spec_path,
-                fix_text_len=args.fix_text_len,
-            )
-            if fix_input is not None:
-                fix_inputs.append(fix_input)
-
-        fix_path = Path(args.fix_prompts_path) if args.fix_prompts_path else (input_path / "llm_fix_inputs.json")
-        if args.emit_fix_prompts or fix_inputs:
-            _write_json(fix_path, fix_inputs)
-
+        fix_inputs: List[Dict[str, Any]] = []
         llm_results: List[Dict[str, Any]] = []
         should_apply_llm = bool(args.apply_llm or args.auto_apply_llm)
-        if should_apply_llm and fix_inputs:
-            llm_inputs_path = (
-                Path(args.llm_inputs_path) if args.llm_inputs_path else (input_path / "llm_fix_inputs.json")
-            )
-            if llm_inputs_path.exists():
-                fix_inputs = _read_json(llm_inputs_path)
+        fix_path = Path(args.fix_prompts_path) if args.fix_prompts_path else (input_path / "llm_fix_inputs.json")
+        results_path = (
+            Path(args.llm_results_path) if args.llm_results_path else (input_path / "llm_fix_results.json")
+        )
+
+        max_llm_rounds = 2
+        llm_round = 0
+        stalled_jsons: set = set()
+        last_error_counts = {
+            _report_json_filename(report): _report_error_count(report)
+            for report in reports
+            if report.get("status") == "FAIL_LLM" and _report_json_filename(report)
+        }
+
+        client = None
+        settings = None
+        max_workers = None
+        if should_apply_llm:
             settings = _load_ark_settings(args.model)
             if not settings["api_key"]:
                 logger.error("未检测到 ARK_API_KEY")
@@ -595,7 +600,33 @@ def main() -> None:
             cpu_count = os.cpu_count() or 1
             max_workers = max(1, (cpu_count * 2) // 3)
             logger.info(f"LLM 并发线程数: {max_workers}")
-            llm_results = []
+
+        while should_apply_llm and llm_round < max_llm_rounds:
+            fix_inputs = []
+            for report in reports:
+                if report.get("status") != "FAIL_LLM":
+                    continue
+                json_filename = _report_json_filename(report)
+                if not json_filename or json_filename in stalled_jsons:
+                    continue
+                fix_input = build_fix_prompt_input(
+                    report,
+                    input_path,
+                    spec,
+                    spec_path=spec_path,
+                    fix_text_len=args.fix_text_len,
+                )
+                if fix_input is not None:
+                    fix_inputs.append(fix_input)
+
+            if args.emit_fix_prompts or fix_inputs:
+                _write_json(fix_path, fix_inputs)
+
+            if not fix_inputs:
+                break
+
+            llm_round += 1
+            logger.info(f"LLM 修复轮次: {llm_round}/{max_llm_rounds}，任务数: {len(fix_inputs)}")
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_to_input = {
                     executor.submit(
@@ -610,10 +641,27 @@ def main() -> None:
                     for fix_input in fix_inputs
                 }
                 for future in as_completed(future_to_input):
-                    llm_results.append(future.result())
-            results_path = (
-                Path(args.llm_results_path) if args.llm_results_path else (input_path / "llm_fix_results.json")
-            )
+                    result = future.result()
+                    if isinstance(result, dict):
+                        result["llm_round"] = llm_round
+                    llm_results.append(result)
+
+            summary, reports = validate_dir(input_path, spec, extracted_text_preview_len=args.preview_len)
+            reports = _apply_company_consistency_checks(input_path, reports, company_records)
+
+            for report in reports:
+                if report.get("status") != "FAIL_LLM":
+                    continue
+                json_filename = _report_json_filename(report)
+                if not json_filename:
+                    continue
+                current_errors = _report_error_count(report)
+                previous_errors = last_error_counts.get(json_filename)
+                if previous_errors is not None and current_errors >= previous_errors:
+                    stalled_jsons.add(json_filename)
+                last_error_counts[json_filename] = current_errors
+
+        if should_apply_llm and llm_results:
             _write_json(results_path, llm_results)
             durations = [
                 item.get("llm_call_seconds")
@@ -628,16 +676,33 @@ def main() -> None:
                     total / len(durations),
                     max(durations),
                 )
-            summary, reports = validate_dir(input_path, spec, extracted_text_preview_len=args.preview_len)
 
-        reports = _apply_company_consistency_checks(input_path, reports, company_records)
+        if should_apply_llm and reports:
+            for report in reports:
+                if report.get("status") != "FAIL_LLM":
+                    continue
+                json_filename = _report_json_filename(report)
+                if json_filename not in stalled_jsons and llm_round < max_llm_rounds:
+                    continue
+                errors = report.get("errors")
+                error_list = list(errors) if isinstance(errors, list) else []
+                error_list.append(
+                    {
+                        "code": "LLM_FIX_MAX_ROUNDS",
+                        "field": "llm_fix",
+                        "message": "LLM 修复超过最大轮次仍失败，已升级为人工处理",
+                    }
+                )
+                report["errors"] = error_list
+                report["status"] = "FAIL_HUMAN"
+
         summary = _rebuild_summary(spec.get("spec_version"), input_path, reports)
         logger.info(f"校验完成: total={summary['total']} pass={summary['pass']} fail_human={summary['fail_human']} fail_llm={summary['fail_llm']}")
         detail_path = _write_validation_detail(input_path, summary, reports)
         logger.info(f"校验详情: {detail_path}")
         if args.emit_fix_prompts or fix_inputs:
             logger.info(f"已写入修复提示词输入: {len(fix_inputs)} 个 -> {fix_path}")
-        if should_apply_llm and fix_inputs:
+        if should_apply_llm and llm_results:
             logger.info(f"已写入修复结果: {len(llm_results)} 个 -> {results_path}")
         return
 
@@ -667,29 +732,45 @@ def main() -> None:
 
     should_apply_llm = bool(args.apply_llm or args.auto_apply_llm)
     if should_apply_llm and report.get("status") == "FAIL_LLM":
-        fix_input = build_fix_prompt_input(
-            report,
-            input_path.parent,
-            spec,
-            spec_path=spec_path,
-            fix_text_len=args.fix_text_len,
+        max_llm_rounds = 2
+        llm_round = 0
+        stalled = False
+        last_error_count = _report_error_count(report)
+
+        fix_path = (
+            Path(args.fix_prompts_path)
+            if args.fix_prompts_path
+            else input_path.with_name(input_path.name.replace("_extracted_revised.json", "_llm_fix_input.json"))
         )
-        if fix_input is not None:
-            fix_path = (
-                Path(args.fix_prompts_path)
-                if args.fix_prompts_path
-                else input_path.with_name(input_path.name.replace("_extracted_revised.json", "_llm_fix_input.json"))
+        results_path = (
+            Path(args.llm_results_path)
+            if args.llm_results_path
+            else input_path.with_name(input_path.name.replace("_extracted_revised.json", "_llm_fix_result.json"))
+        )
+
+        settings = _load_ark_settings(args.model)
+        if not settings["api_key"]:
+            logger.error("未检测到 ARK_API_KEY")
+            os.sys.exit(2)
+        client = _create_ark_client(settings["base_url"], settings["api_key"])
+
+        while report.get("status") == "FAIL_LLM" and llm_round < max_llm_rounds and not stalled:
+            fix_input = build_fix_prompt_input(
+                report,
+                input_path.parent,
+                spec,
+                spec_path=spec_path,
+                fix_text_len=args.fix_text_len,
             )
+            if fix_input is None:
+                break
+
             if args.emit_fix_prompts:
                 _write_json(fix_path, fix_input)
                 logger.info(f"修复提示词输入: {fix_path}")
 
-            settings = _load_ark_settings(args.model)
-            if not settings["api_key"]:
-                logger.error("未检测到 ARK_API_KEY")
-                os.sys.exit(2)
-            client = _create_ark_client(settings["base_url"], settings["api_key"])
-
+            llm_round += 1
+            logger.info(f"LLM 修复轮次: {llm_round}/{max_llm_rounds}")
             result = _apply_llm_fix(
                 fix_input=fix_input,
                 json_dir=input_path.parent,
@@ -698,18 +779,50 @@ def main() -> None:
                 model=settings["model"],
                 preview_len=args.preview_len,
             )
-            results_path = (
-                Path(args.llm_results_path)
-                if args.llm_results_path
-                else input_path.with_name(input_path.name.replace("_extracted_revised.json", "_llm_fix_result.json"))
-            )
+            if isinstance(result, dict):
+                result["llm_round"] = llm_round
             _write_json(results_path, result)
             logger.info(f"修复结果: {results_path}")
 
             report = validate_extracted_json(input_path, spec, extracted_text_preview_len=args.preview_len)
-            summary["pass"] = 1 if report.get("status") == "PASS" else 0
-            summary["fail_human"] = 1 if report.get("status") == "FAIL_HUMAN" else 0
-            summary["fail_llm"] = 1 if report.get("status") == "FAIL_LLM" else 0
+            try:
+                payload = _read_json(input_path)
+                if isinstance(payload, dict) and _company_mismatch(payload, company_records):
+                    errors = report.get("errors")
+                    error_list = list(errors) if isinstance(errors, list) else []
+                    error_list.append(
+                        {
+                            "code": "COMPANY_INFO_MISMATCH",
+                            "field": "company",
+                            "message": "公司信息与公司库不一致",
+                        }
+                    )
+                    report["errors"] = error_list
+                    report["status"] = "FAIL_HUMAN"
+            except Exception:
+                pass
+
+            current_error_count = _report_error_count(report)
+            if current_error_count >= last_error_count:
+                stalled = True
+            last_error_count = current_error_count
+
+        if report.get("status") == "FAIL_LLM":
+            errors = report.get("errors")
+            error_list = list(errors) if isinstance(errors, list) else []
+            error_list.append(
+                {
+                    "code": "LLM_FIX_MAX_ROUNDS",
+                    "field": "llm_fix",
+                    "message": "LLM 修复超过最大轮次仍失败，已升级为人工处理",
+                }
+            )
+            report["errors"] = error_list
+            report["status"] = "FAIL_HUMAN"
+
+        summary["pass"] = 1 if report.get("status") == "PASS" else 0
+        summary["fail_human"] = 1 if report.get("status") == "FAIL_HUMAN" else 0
+        summary["fail_llm"] = 1 if report.get("status") == "FAIL_LLM" else 0
 
     detail_path = _write_validation_detail(input_path.parent, summary, [report])
     if report.get("status") != "PASS":

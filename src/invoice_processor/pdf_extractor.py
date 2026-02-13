@@ -29,7 +29,7 @@ class PDFExtractor:
         self.ocr_engine = ocr_engine or OCREngine()
         patterns = patterns or self.load_patterns()
         self.doc_patterns = patterns['doc_patterns']
-        self.field_patterns = patterns['field_patterns']
+        self.field_patterns = self._apply_field_pattern_overrides(patterns)
         self.company_records = company_records or []
         self.company_names = self._build_company_names(self.company_records)
 
@@ -37,6 +37,47 @@ class PDFExtractor:
         patterns_path = Path(__file__).with_name('patterns.json')
         with open(patterns_path, 'r', encoding='utf-8') as f:
             return json.load(f)
+
+    def _apply_field_pattern_overrides(self, patterns: Dict[str, Any]) -> Dict[str, Any]:
+        field_patterns = patterns.get('field_patterns')
+        if not isinstance(field_patterns, dict):
+            return {}
+        overrides = patterns.get('field_patterns_overrides')
+        if not isinstance(overrides, dict):
+            return field_patterns
+        merged: Dict[str, Any] = json.loads(json.dumps(field_patterns, ensure_ascii=False))
+        for doc_type, fields in overrides.items():
+            if not isinstance(fields, dict):
+                continue
+            for field, items in fields.items():
+                if not isinstance(items, list):
+                    continue
+                override_regexes = []
+                for item in items:
+                    if isinstance(item, str):
+                        override_regexes.append(item)
+                        continue
+                    if isinstance(item, dict):
+                        regex = item.get('regex')
+                        if isinstance(regex, str):
+                            override_regexes.append((item.get('priority', 0), regex))
+                ranked = []
+                for item in override_regexes:
+                    if isinstance(item, tuple):
+                        ranked.append(item)
+                    else:
+                        ranked.append((0, item))
+                ranked.sort(key=lambda x: x[0], reverse=True)
+                regex_list = [regex for _, regex in ranked]
+                doc_bucket = merged.get(doc_type)
+                if not isinstance(doc_bucket, dict):
+                    doc_bucket = {}
+                    merged[doc_type] = doc_bucket
+                current = doc_bucket.get(field)
+                if not isinstance(current, list):
+                    current = []
+                doc_bucket[field] = regex_list + current
+        return merged
 
     def detect_document_type(self, text: str) -> str:
         """基于文本内容检测文档类型 - 增强版"""

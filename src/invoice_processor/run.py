@@ -19,7 +19,7 @@ def main():
     # Construct the command
     cmd = [sys.executable, main_script] + sys.argv[1:]
     
-    print(f"Starting Invoice Processor...")
+    print("Starting Invoice Processor...")
     print(f"Target: {main_script}")
     print("-" * 40)
     

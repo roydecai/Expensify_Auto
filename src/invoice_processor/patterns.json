@@ -99,5 +99,6 @@
         "收款人[:：]\\s*([^\\n\\r\\t\\f\\v]{5,60})"
       ]
     }
-  }
+  },
+  "field_patterns_overrides": {}
 }

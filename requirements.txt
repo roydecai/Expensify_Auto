@@ -5,3 +5,5 @@ pdf2image==1.17.0
 Pillow==12.1.0
 python-dotenv==1.0.1
 volcengine-python-sdk[ark]==1.0.125
+ruff==0.9.7
+mypy==1.14.1

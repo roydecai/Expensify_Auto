@@ -1,9 +1,11 @@
 import argparse
 import json
 import logging
+import importlib
 import os
 import re
 import sqlite3
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -11,7 +13,6 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from config import get_company_db_path, get_default_model_id, get_project_root
 from date_utils import normalize_date_string
-from dotenv import load_dotenv
 from pdf_extraction_service import PDFExtractionService
 from pdf_json_validator import load_spec, validate_dir, validate_extracted_json
 from text_utils import (
@@ -20,6 +21,15 @@ from text_utils import (
     normalize_bank_receipt_uid,
     normalize_direction,
 )
+
+def load_dotenv() -> None:
+    try:
+        mod = importlib.import_module("dotenv")
+        maybe = getattr(mod, "load_dotenv", None)
+        if callable(maybe):
+            maybe()
+    except Exception:
+        return None
 
 
 def configure_logging(level: int = logging.INFO) -> None:
@@ -230,12 +240,92 @@ def _validation_detail_path(json_dir: Path) -> Path:
     return json_dir / "validation_detail.json"
 
 
-def _write_validation_detail(json_dir: Path, summary: Dict[str, Any], reports: List[Dict[str, Any]]) -> Path:
-    detail = dict(summary)
-    detail["reports"] = reports
+def _write_validation_detail(
+    json_dir: Path, summary: Dict[str, Any], reports: List[Dict[str, Any]]
+) -> Optional[Path]:
+    filtered = [report for report in reports if report.get("status") == "FAIL_HUMAN"]
     detail_path = _validation_detail_path(json_dir)
+    if not filtered:
+        if detail_path.exists():
+            try:
+                detail_path.unlink()
+            except Exception:
+                pass
+        return None
+    detail = _rebuild_summary(summary.get("spec_version"), json_dir, filtered)
+    detail["reports"] = filtered
     _write_json(detail_path, detail)
     return detail_path
+
+
+def _human_review_cases_path(json_dir: Path) -> Path:
+    return json_dir / "human_review_cases.json"
+
+
+def _required_fields_by_doc_type(spec: Dict[str, Any]) -> Dict[str, List[str]]:
+    schemas = spec.get("document_schemas", {})
+    if not isinstance(schemas, dict):
+        return {}
+    out: Dict[str, List[str]] = {}
+    for doc_type, schema in schemas.items():
+        if not isinstance(doc_type, str) or not isinstance(schema, dict):
+            continue
+        required = schema.get("required_fields", [])
+        if isinstance(required, list):
+            out[doc_type] = [str(x) for x in required if isinstance(x, str)]
+    return out
+
+
+def _write_human_review_cases(
+    json_dir: Path,
+    *,
+    spec: Dict[str, Any],
+    spec_path: Path,
+    reports: List[Dict[str, Any]],
+) -> Optional[Path]:
+    cases: List[Dict[str, Any]] = []
+    for report in reports:
+        if report.get("status") != "FAIL_HUMAN":
+            continue
+        ctx = report.get("context", {})
+        if not isinstance(ctx, dict):
+            ctx = {}
+        cases.append(
+            {
+                "pdf_filename": ctx.get("pdf_filename"),
+                "json_filename": ctx.get("json_filename"),
+                "document_type": report.get("document_type"),
+                "errors": report.get("errors", []),
+                "warnings": report.get("warnings", []),
+                "extracted_text_preview": ctx.get("extracted_text_preview"),
+            }
+        )
+    if not cases:
+        return None
+
+    field_rules = spec.get("field_rules", {})
+    excerpt = {}
+    if isinstance(field_rules, dict):
+        for key in ("uid", "date", "amount_like", "amount_like_signed", "name_like", "direction", "tax_id"):
+            rule = field_rules.get(key)
+            if isinstance(rule, dict):
+                excerpt[key] = rule
+
+    payload = {
+        "spec_version": spec.get("spec_version"),
+        "spec_path": str(spec_path),
+        "required_fields_by_document_type": _required_fields_by_doc_type(spec),
+        "field_rules_excerpt": excerpt,
+        "cases": cases,
+        "instructions": [
+            "请逐条打开 json_filename 对应的 *_extracted_revised.json，基于 extracted_text 纠正缺失/错误字段。",
+            "uid/date/amount/name 字段必须满足 spec 中的格式与字符策略；无法从 extracted_text 确认时请保持为空并标注原因。",
+            "修正后重新运行 main.py 对目录做校验，直至 PASS。",
+        ],
+    }
+    path = _human_review_cases_path(json_dir)
+    _write_json(path, payload)
+    return path
 
 
 def _cleanup_validation_outputs(json_dir: Path) -> None:
@@ -421,9 +511,11 @@ def _load_ark_settings(default_model: str) -> Dict[str, str]:
 
 
 def _create_ark_client(base_url: str, api_key: str) -> Any:
-    from volcenginesdkarkruntime import Ark
-
-    return Ark(base_url=base_url, api_key=api_key)
+    mod = importlib.import_module("volcenginesdkarkruntime")
+    ark_cls = getattr(mod, "Ark", None)
+    if not callable(ark_cls):
+        raise RuntimeError("volcenginesdkarkruntime.Ark 不可用")
+    return ark_cls(base_url=base_url, api_key=api_key)
 
 
 def _apply_llm_fix(
@@ -561,9 +653,9 @@ def main() -> None:
         output_dir = _resolve_output_dir(args.output_dir)
         service = PDFExtractionService()
         if args.sequential or args.workers <= 1:
-            service.process_pdfs_sequentially(pdf_paths, output_dir=output_dir)
+            service.process_pdfs_sequentially(pdf_paths, output_dir=str(output_dir))
         else:
-            service.process_pdfs_multithread(pdf_paths, max_workers=args.workers, output_dir=output_dir)
+            service.process_pdfs_multithread(pdf_paths, max_workers=args.workers, output_dir=str(output_dir))
         service.close()
         input_path = output_dir
     if input_path.is_dir():
@@ -581,25 +673,42 @@ def main() -> None:
 
         max_llm_rounds = 2
         llm_round = 0
-        stalled_jsons: set = set()
-        last_error_counts = {
-            _report_json_filename(report): _report_error_count(report)
-            for report in reports
-            if report.get("status") == "FAIL_LLM" and _report_json_filename(report)
-        }
+        stalled_jsons: set[str] = set()
+        last_error_counts: dict[str, int] = {}
+        for report in reports:
+            if report.get("status") != "FAIL_LLM":
+                continue
+            json_filename = _report_json_filename(report)
+            if isinstance(json_filename, str) and json_filename:
+                last_error_counts[json_filename] = _report_error_count(report)
 
-        client = None
-        settings = None
-        max_workers = None
+        client: Any = None
+        settings: Dict[str, str] = {}
+        max_workers = 1
         if should_apply_llm:
             settings = _load_ark_settings(args.model)
             if not settings["api_key"]:
-                logger.error("未检测到 ARK_API_KEY")
-                os.sys.exit(2)
-            client = _create_ark_client(settings["base_url"], settings["api_key"])
-            cpu_count = os.cpu_count() or 1
-            max_workers = max(1, (cpu_count * 2) // 3)
-            logger.info(f"LLM 并发线程数: {max_workers}")
+                logger.error("未检测到 ARK_API_KEY，无法自动 LLM 修复，已升级为人工处理")
+                for report in reports:
+                    if report.get("status") != "FAIL_LLM":
+                        continue
+                    errors = report.get("errors")
+                    error_list = list(errors) if isinstance(errors, list) else []
+                    error_list.append(
+                        {
+                            "code": "LLM_API_KEY_MISSING",
+                            "field": "llm_fix",
+                            "message": "未配置 ARK_API_KEY，无法自动 LLM 修复",
+                        }
+                    )
+                    report["errors"] = error_list
+                    report["status"] = "FAIL_HUMAN"
+                should_apply_llm = False
+            else:
+                client = _create_ark_client(settings["base_url"], settings["api_key"])
+                cpu_count = os.cpu_count() or 1
+                max_workers = max(1, (cpu_count * 2) // 3)
+                logger.info(f"LLM 并发线程数: {max_workers}")
 
         while should_apply_llm and llm_round < max_llm_rounds:
             fix_inputs = []
@@ -663,11 +772,13 @@ def main() -> None:
 
         if should_apply_llm and llm_results:
             _write_json(results_path, llm_results)
-            durations = [
-                item.get("llm_call_seconds")
-                for item in llm_results
-                if isinstance(item, dict) and isinstance(item.get("llm_call_seconds"), (int, float))
-            ]
+            durations: List[float] = []
+            for item in llm_results:
+                if not isinstance(item, dict):
+                    continue
+                value = item.get("llm_call_seconds")
+                if isinstance(value, (int, float)):
+                    durations.append(float(value))
             if durations:
                 total = sum(durations)
                 logger.info(
@@ -699,7 +810,11 @@ def main() -> None:
         summary = _rebuild_summary(spec.get("spec_version"), input_path, reports)
         logger.info(f"校验完成: total={summary['total']} pass={summary['pass']} fail_human={summary['fail_human']} fail_llm={summary['fail_llm']}")
         detail_path = _write_validation_detail(input_path, summary, reports)
-        logger.info(f"校验详情: {detail_path}")
+        if detail_path:
+            logger.info(f"校验详情: {detail_path}")
+        human_path = _write_human_review_cases(input_path, spec=spec, spec_path=spec_path, reports=reports)
+        if human_path:
+            logger.info(f"人工处理清单: {human_path}")
         if args.emit_fix_prompts or fix_inputs:
             logger.info(f"已写入修复提示词输入: {len(fix_inputs)} 个 -> {fix_path}")
         if should_apply_llm and llm_results:
@@ -708,25 +823,16 @@ def main() -> None:
 
     if not input_path.exists():
         logger.error("input_path 不存在")
-        os.sys.exit(2)
+        sys.exit(2)
 
-    report = validate_extracted_json(input_path, spec, extracted_text_preview_len=args.preview_len)
-    try:
-        payload = _read_json(input_path)
-        if isinstance(payload, dict) and _company_mismatch(payload, company_records):
-            errors = report.get("errors")
-            error_list = list(errors) if isinstance(errors, list) else []
-            error_list.append(
-                {
-                    "code": "COMPANY_INFO_MISMATCH",
-                    "field": "company",
-                    "message": "公司信息与公司库不一致",
-                }
-            )
-            report["errors"] = error_list
-            report["status"] = "FAIL_HUMAN"
-    except Exception:
-        pass
+    pdf_path = None
+    if input_path.name.endswith("_extracted_revised.json"):
+        pdf_path = input_path.with_name(input_path.name.replace("_extracted_revised.json", ".pdf"))
+    report = validate_extracted_json(
+        input_path, spec, pdf_path=pdf_path, extracted_text_preview_len=args.preview_len
+    )
+    reports = _apply_company_consistency_checks(input_path.parent, [report], company_records)
+    report = reports[0] if reports else report
 
     summary = _rebuild_summary(spec.get("spec_version"), input_path.parent, [report])
 
@@ -748,13 +854,28 @@ def main() -> None:
             else input_path.with_name(input_path.name.replace("_extracted_revised.json", "_llm_fix_result.json"))
         )
 
+        single_client: Any = None
+        model = ""
         settings = _load_ark_settings(args.model)
         if not settings["api_key"]:
-            logger.error("未检测到 ARK_API_KEY")
-            os.sys.exit(2)
-        client = _create_ark_client(settings["base_url"], settings["api_key"])
+            logger.error("未检测到 ARK_API_KEY，无法自动 LLM 修复，已升级为人工处理")
+            errors = report.get("errors")
+            error_list = list(errors) if isinstance(errors, list) else []
+            error_list.append(
+                {
+                    "code": "LLM_API_KEY_MISSING",
+                    "field": "llm_fix",
+                    "message": "未配置 ARK_API_KEY，无法自动 LLM 修复",
+                }
+            )
+            report["errors"] = error_list
+            report["status"] = "FAIL_HUMAN"
+            should_apply_llm = False
+        else:
+            single_client = _create_ark_client(settings["base_url"], settings["api_key"])
+            model = settings["model"]
 
-        while report.get("status") == "FAIL_LLM" and llm_round < max_llm_rounds and not stalled:
+        while should_apply_llm and report.get("status") == "FAIL_LLM" and llm_round < max_llm_rounds and not stalled:
             fix_input = build_fix_prompt_input(
                 report,
                 input_path.parent,
@@ -775,8 +896,8 @@ def main() -> None:
                 fix_input=fix_input,
                 json_dir=input_path.parent,
                 spec=spec,
-                client=client,
-                model=settings["model"],
+                client=single_client,
+                model=model,
                 preview_len=args.preview_len,
             )
             if isinstance(result, dict):
@@ -785,22 +906,8 @@ def main() -> None:
             logger.info(f"修复结果: {results_path}")
 
             report = validate_extracted_json(input_path, spec, extracted_text_preview_len=args.preview_len)
-            try:
-                payload = _read_json(input_path)
-                if isinstance(payload, dict) and _company_mismatch(payload, company_records):
-                    errors = report.get("errors")
-                    error_list = list(errors) if isinstance(errors, list) else []
-                    error_list.append(
-                        {
-                            "code": "COMPANY_INFO_MISMATCH",
-                            "field": "company",
-                            "message": "公司信息与公司库不一致",
-                        }
-                    )
-                    report["errors"] = error_list
-                    report["status"] = "FAIL_HUMAN"
-            except Exception:
-                pass
+            reports = _apply_company_consistency_checks(input_path.parent, [report], company_records)
+            report = reports[0] if reports else report
 
             current_error_count = _report_error_count(report)
             if current_error_count >= last_error_count:
@@ -825,10 +932,11 @@ def main() -> None:
         summary["fail_llm"] = 1 if report.get("status") == "FAIL_LLM" else 0
 
     detail_path = _write_validation_detail(input_path.parent, summary, [report])
-    if report.get("status") != "PASS":
+    if report.get("status") != "PASS" and detail_path:
         logger.info(f"FAIL 详情: {detail_path}")
     else:
         logger.info("校验通过")
+    _write_human_review_cases(input_path.parent, spec=spec, spec_path=spec_path, reports=[report])
 
 
 if __name__ == "__main__":

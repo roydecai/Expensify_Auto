@@ -58,6 +58,16 @@ class Finding:
         return payload
 
 
+def _infer_pdf_path(json_path: Path) -> Path:
+    name = json_path.name
+    suffix = "_extracted_revised.json"
+    if name.endswith(suffix):
+        stem = name[: -len(suffix)]
+    else:
+        stem = json_path.stem
+    return json_path.with_name(f"{stem}.pdf")
+
+
 def validate_extracted_json(
     json_path: Union[str, Path],
     spec: JsonDict,
@@ -279,7 +289,7 @@ def validate_extracted_json(
 
             if rule_name == "date":
                 _validate_date(field, value, rule, today, errors)
-            elif rule_name == "amount_like":
+            elif rule_name in ("amount_like", "amount_like_signed"):
                 _validate_regex(field, value, rule, "format", errors)
             elif rule_name == "uid":
                 if document_type == "bank_receipt" and rule.get("bank_receipt_trim_trailing_symbols") is True:
@@ -578,39 +588,50 @@ def validate_dir(
     json_files = sorted(json_dir.glob("*_extracted_revised.json"))
 
     reports: List[JsonDict] = []
-    summary = {
+    total = 0
+    pass_count = 0
+    fail_human = 0
+    fail_llm = 0
+    errors_by_code: Dict[str, int] = {}
+    summary: JsonDict = {
         "spec_version": spec.get("spec_version"),
         "dir": str(json_dir),
-        "total": 0,
-        "pass": 0,
-        "fail_human": 0,
-        "fail_llm": 0,
-        "errors_by_code": {},
+        "total": total,
+        "pass": pass_count,
+        "fail_human": fail_human,
+        "fail_llm": fail_llm,
+        "errors_by_code": errors_by_code,
         "generated_at": datetime.now().isoformat(timespec="seconds"),
     }
 
     for json_path in json_files:
+        pdf_path = _infer_pdf_path(json_path)
         report = validate_extracted_json(
             json_path,
             spec,
+            pdf_path=pdf_path,
             today=today,
             extracted_text_preview_len=extracted_text_preview_len,
         )
-        summary["total"] += 1
+        total += 1
         status = report.get("status")
         if status == spec.get("status_model", {}).get("pass", "PASS"):
-            summary["pass"] += 1
+            pass_count += 1
         elif status == spec.get("status_model", {}).get("fail_human", "FAIL_HUMAN"):
-            summary["fail_human"] += 1
+            fail_human += 1
         else:
-            summary["fail_llm"] += 1
+            fail_llm += 1
 
         for err in report.get("errors", []):
             code = err.get("code")
             if not isinstance(code, str):
                 continue
-            summary["errors_by_code"][code] = summary["errors_by_code"].get(code, 0) + 1
+            errors_by_code[code] = errors_by_code.get(code, 0) + 1
 
         reports.append(report)
 
+    summary["total"] = total
+    summary["pass"] = pass_count
+    summary["fail_human"] = fail_human
+    summary["fail_llm"] = fail_llm
     return summary, reports

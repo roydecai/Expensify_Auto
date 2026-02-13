@@ -1,45 +1,35 @@
-import importlib
 import logging
 import os
 from pathlib import Path
 import tempfile
 import threading
 import gc
-from typing import Any, List, Union, Optional
 
-PaddleOCR: Optional[Any] = None
 try:
-    mod = importlib.import_module("paddleocr")
-    PaddleOCR = getattr(mod, "PaddleOCR", None)
-    HAS_PADDLE = callable(PaddleOCR)
-except Exception:
+    from paddleocr import PaddleOCR
+    HAS_PADDLE = True
+except ImportError:
     HAS_PADDLE = False
 
-pdfplumber: Optional[Any] = None
 try:
-    pdfplumber = importlib.import_module("pdfplumber")
+    import pdfplumber
     HAS_PDFPLUMBER = True
-except Exception:
+except ImportError:
     HAS_PDFPLUMBER = False
 
-convert_from_path: Optional[Any] = None
 try:
-    mod = importlib.import_module("pdf2image")
-    convert_from_path = getattr(mod, "convert_from_path", None)
-    HAS_PDF2IMAGE = callable(convert_from_path)
-except Exception:
+    from pdf2image import convert_from_path
+    HAS_PDF2IMAGE = True
+except ImportError:
     HAS_PDF2IMAGE = False
 
 logger = logging.getLogger(__name__)
 
 class OCREngine:
-    _instances: dict[tuple[bool], Any] = {}
+    _instances = {}
     _instance_lock = threading.Lock()
-    _initialized: bool
-    paddle_model: Optional[Any]
-    _model_init_failed: bool
 
-    def __new__(cls, use_gpu: bool = False):
+    def __new__(cls, use_gpu=False):
         key = (use_gpu,)
         with cls._instance_lock:
             instance = cls._instances.get(key)
@@ -49,7 +39,7 @@ class OCREngine:
                 cls._instances[key] = instance
         return instance
 
-    def __init__(self, use_gpu: bool = False) -> None:
+    def __init__(self, use_gpu=False):
         if self._initialized:
             return
         self.use_gpu = use_gpu
@@ -61,8 +51,8 @@ class OCREngine:
         if not HAS_PADDLE:
             logger.warning("PaddleOCR not installed. OCR capabilities will be limited.")
 
-    def _ensure_paddle_model(self) -> bool:
-        if not HAS_PADDLE or PaddleOCR is None:
+    def _ensure_paddle_model(self):
+        if not HAS_PADDLE:
             return False
         if self._model_init_failed:
             return False
@@ -85,16 +75,14 @@ class OCREngine:
                 self._model_init_failed = True
                 return False
 
-    def release(self) -> None:
+    def release(self):
         self.paddle_model = None
         self._model_init_failed = False
         gc.collect()
 
-    def extract_text_from_image(self, image_path: Union[str, Path]) -> str:
+    def extract_text_from_image(self, image_path):
         """Extract text from image using PaddleOCR"""
         if not self._ensure_paddle_model():
-            return ""
-        if self.paddle_model is None:
             return ""
 
         try:
@@ -111,9 +99,9 @@ class OCREngine:
             logger.error(f"OCR on image failed: {e}")
             return ""
 
-    def convert_pdf_to_images(self, pdf_path: Union[str, Path]) -> List[Any]:
+    def convert_pdf_to_images(self, pdf_path):
         """Convert PDF to list of PIL Images"""
-        if not HAS_PDF2IMAGE or convert_from_path is None:
+        if not HAS_PDF2IMAGE:
             logger.warning("pdf2image not installed. Cannot convert PDF to images for OCR.")
             return []
 
@@ -125,7 +113,7 @@ class OCREngine:
             logger.error(f"Failed to convert PDF to images: {e}")
             return []
 
-    def extract_text(self, pdf_path: Union[str, Path]) -> str:
+    def extract_text(self, pdf_path):
         """
         Extract text from PDF. Tries multiple strategies:
         1. pdfplumber (fast, good for digital PDFs)
@@ -134,7 +122,7 @@ class OCREngine:
         text_content = ""
 
         # Strategy 1: pdfplumber (Digital PDF)
-        if HAS_PDFPLUMBER and pdfplumber is not None:
+        if HAS_PDFPLUMBER:
             try:
                 with pdfplumber.open(pdf_path) as pdf:
                     for page in pdf.pages:

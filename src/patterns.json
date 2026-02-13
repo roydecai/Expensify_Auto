@@ -14,11 +14,6 @@
       "密码区"
     ],
     "bank_receipt": [
-      {
-        "regex": "(入账回单|出账回单|客户回单|跨境金融业务回单|银行\\s*回单|银行流水|交易流水|回单编号|回单编码|银行)",
-        "priority": 1000,
-        "precheck": true
-      },
       "银行.*水单",
       "银行.*回单",
       "客户回单",
@@ -36,60 +31,14 @@
       "银行.*客户回单"
     ],
     "tax_certificate": [
-      {
-        "regex": "税\\s*收\\s*完\\s*税\\s*证\\s*明",
-        "priority": 900,
-        "precheck": true
-      },
-      "税\\s*收\\s*完\\s*税\\s*证\\s*明"
-    ]
-  },
-  "text_cleanup": {
-    "bank_name_keywords": [
-      "银行",
-      "分行",
-      "支行",
-      "信用社",
-      "农村商业银行",
-      "商业银行"
-    ],
-    "bank_receipt_cut_keywords": [
-      "交易对方",
-      "对方账号",
-      "账号",
-      "行号",
-      "开户行",
-      "银行名称",
-      "银行行号",
-      "收款人名称",
-      "付款人名称",
-      "收款人",
-      "付款人"
-    ],
-    "invoice_company_cut_keywords": [
-      "买售方",
-      "买方",
-      "购方",
-      "购买方",
-      "销方",
-      "销售方",
-      "卖方",
-      "方信",
-      "统一社会信用代码",
+      "完税证明",
+      "税收缴款书",
+      "纳税凭证",
+      "税务机关",
+      "税票号码",
       "纳税人识别号",
-      "地址",
-      "电话",
-      "开户行",
-      "账号",
-      "发票号码",
-      "开票日期",
-      "价税合计",
-      "合计",
-      "税额",
-      "金额"
-    ],
-    "bank_receipt_tax_keywords": [
-      "税"
+      "征收机关",
+      "税收完税证明"
     ]
   },
   "field_patterns": {
@@ -156,79 +105,14 @@
         "对方户名[:：]\\s*([^\\n\\r\\t\\f\\v]{5,60})",
         "收款人[:：]\\s*([^\\n\\r\\t\\f\\v]{5,60})"
       ]
-    }
-  },
-  "field_patterns_overrides": {
-    "common": {
-      "uid": [
-        {
-          "id": "uid_tax_core_serial_v1",
-          "priority": 910,
-          "regex": "核心流水号[:：]?\\s*([A-Za-z0-9]{8,30})"
-        },
-        {
-          "id": "uid_bank_receipt_receipt_code_v1",
-          "priority": 900,
-          "regex": "回单编码[:：]?\\s*([A-Za-z0-9]{8,30})"
-        },
-        {
-          "id": "uid_bank_receipt_receipt_no_v1",
-          "priority": 890,
-          "regex": "回单编号[:：]?\\s*([A-Za-z0-9]{8,30})"
-        },
-        {
-          "id": "uid_bank_receipt_txn_serial_v1",
-          "priority": 880,
-          "regex": "交易流水[:：]?\\s*([A-Za-z0-9]{8,30})"
-        },
-        {
-          "id": "uid_bank_receipt_biz_unique_no_v1",
-          "priority": 870,
-          "regex": "业务唯一编号\\s*(\\d{12,30})"
-        }
-      ],
-      "amount": [
-        {
-          "id": "amt_bank_receipt_txn_amt_small_v1",
-          "priority": 900,
-          "regex": "交易金额\\(小写\\)[:：]?\\s*(?:[A-Z]{3})\\s*([\\d,，]+\\.\\d{2})"
-        },
-        {
-          "id": "amt_bank_receipt_txn_amt_small_no_ccy_v1",
-          "priority": 890,
-          "regex": "交易金额\\(小写\\)[:：]?\\s*([\\d,，]+\\.\\d{2})"
-        },
-        {
-          "id": "amt_bank_receipt_txn_amt_masked_v1",
-          "priority": 880,
-          "regex": "交易金额[:：]?\\s*(?:[A-Z]{3})[\\*\\s]*([\\d,，]+\\.\\d{2})"
-        },
-        {
-          "id": "amt_bank_receipt_ccy_amount_pair_v1",
-          "priority": 870,
-          "regex": "币种[:：]?\\s*[A-Z]{3}\\s*金额[:：]?\\s*([\\d,，]+\\.\\d{2})"
-        },
-        {
-          "id": "amt_invoice_total_signed_v1",
-          "priority": 860,
-          "regex": "价税合计[\\s\\S]{0,60}?小写[）)]?[^0-9\\-]*([-]?[\\d,，]+\\.\\d{2})"
-        }
-      ],
-      "payer": [
-        {
-          "id": "payer_bank_receipt_inline_payer_name_v1",
-          "priority": 900,
-          "regex": "付款人名称[:：]?\\s*([^\\n\\r]{2,80}?)(?=\\s*收款人名称|\\n|$)"
-        }
-      ]
     },
-    "bank_receipt": {
-      "payee": [
-        {
-          "id": "payee_bank_receipt_inline_payee_name_v1",
-          "priority": 900,
-          "regex": "收款人名称[:：]?\\s*([^\\n\\r]{2,80}?)(?=\\s*付款行名称|\\s*收款行名称|\\s*付款人账号|\\s*收款人账号|\\n|$)"
-        }
+    "tax_certificate": {
+      "tax_authority": [
+        "税务机关[:：]\\s*([^\\n\\r\\t\\f\\v]{5,60})",
+        "征收机关[:：]\\s*([^\\n\\r\\t\\f\\v]{5,60})",
+        "税务所[:：]\\s*([^\\n\\r\\t\\f\\v]{5,60})",
+        "主管税务机关[:：]\\s*([^\\n\\r\\t\\f\\v]{5,60})",
+        "征收机关名称[:：]\\s*([^\\n\\r\\t\\f\\v]{5,60})"
       ]
     }
   }

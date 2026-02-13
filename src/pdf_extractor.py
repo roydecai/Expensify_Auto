@@ -1,7 +1,8 @@
 import json
 import re
 import logging
-from typing import Any, Dict, Iterable, Optional, List, Tuple
+from datetime import datetime
+from typing import Dict, Optional, List, Tuple
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -13,118 +14,37 @@ except ImportError:
     sys.path.append(str(Path(__file__).parent))
     from ocr_engine import OCREngine
 
-from config import get_project_root
-from date_utils import normalize_date_string
-from text_utils import clean_project_name, extract_reconcile_vat_num
-
 logger = logging.getLogger(__name__)
 
 class PDFExtractor:
-    def __init__(
-        self,
-        ocr_engine: Optional[OCREngine] = None,
-        patterns: Optional[Dict[str, Any]] = None,
-        company_records: Optional[List[Dict[str, Optional[str]]]] = None,
-    ) -> None:
+    def __init__(self, ocr_engine=None, patterns=None):
         self.ocr_engine = ocr_engine or OCREngine()
         patterns = patterns or self.load_patterns()
-        self.doc_patterns = patterns.get("doc_patterns", {})
-        self.field_patterns = self._apply_field_pattern_overrides(patterns)
-        self.text_cleanup = patterns.get("text_cleanup", {}) if isinstance(patterns, dict) else {}
-        self.company_records = company_records or []
-        self.company_names = self._build_company_names(self.company_records)
+        self.doc_patterns = patterns['doc_patterns']
+        self.field_patterns = patterns['field_patterns']
 
-    def load_patterns(self) -> Dict[str, Any]:
+    def load_patterns(self) -> Dict:
         patterns_path = Path(__file__).with_name('patterns.json')
         with open(patterns_path, 'r', encoding='utf-8') as f:
             return json.load(f)
 
-    def _apply_field_pattern_overrides(self, patterns: Dict[str, Any]) -> Dict[str, Any]:
-        field_patterns = patterns.get('field_patterns')
-        if not isinstance(field_patterns, dict):
-            return {}
-        overrides = patterns.get('field_patterns_overrides')
-        if not isinstance(overrides, dict):
-            return field_patterns
-        merged: Dict[str, Any] = json.loads(json.dumps(field_patterns, ensure_ascii=False))
-        for doc_type, fields in overrides.items():
-            if not isinstance(fields, dict):
-                continue
-            for field, items in fields.items():
-                if not isinstance(items, list):
-                    continue
-                ranked: List[Tuple[int, str]] = []
-                for item in items:
-                    if isinstance(item, str):
-                        ranked.append((0, item))
-                        continue
-                    if isinstance(item, dict):
-                        regex = item.get('regex')
-                        if not isinstance(regex, str):
-                            continue
-                        priority = item.get("priority", 0)
-                        ranked.append((priority if isinstance(priority, int) else 0, regex))
-                ranked.sort(key=lambda x: x[0], reverse=True)
-                regex_list = [regex for _, regex in ranked]
-                doc_bucket = merged.get(doc_type)
-                if not isinstance(doc_bucket, dict):
-                    doc_bucket = {}
-                    merged[doc_type] = doc_bucket
-                current = doc_bucket.get(field)
-                if not isinstance(current, list):
-                    current = []
-                doc_bucket[field] = regex_list + current
-        return merged
-
     def detect_document_type(self, text: str) -> str:
         """基于文本内容检测文档类型 - 增强版"""
-        doc_patterns = self.doc_patterns if isinstance(self.doc_patterns, dict) else {}
-        prechecks: List[Tuple[int, int, str]] = []
-        for doc_type, patterns in doc_patterns.items():
-            if not isinstance(patterns, list):
-                continue
-            for idx, item in enumerate(patterns):
-                if not isinstance(item, dict):
-                    continue
-                regex = item.get("regex")
-                if not isinstance(regex, str):
-                    continue
-                if item.get("precheck") is not True:
-                    continue
-                if re.search(regex, text, re.IGNORECASE):
-                    priority = item.get("priority", 0)
-                    priority = priority if isinstance(priority, int) else 0
-                    prechecks.append((priority, idx, doc_type))
-        if prechecks:
-            prechecks.sort(key=lambda x: (x[0], -x[1]), reverse=True)
-            return prechecks[0][2]
+        text_lower = text.lower()  # 转换为小写便于匹配
 
         # 按优先级检查文档类型
-        scores: Dict[str, int] = {}
+        scores = {}
 
-        for doc_type, patterns in doc_patterns.items():
-            if not isinstance(patterns, list):
-                continue
+        for doc_type, patterns in self.doc_patterns.items():
             score = 0
-            for item in patterns:
+            for pattern in patterns:
                 # 计算匹配次数作为权重
-                regex = None
-                weight = 1
-                if isinstance(item, str):
-                    regex = item
-                elif isinstance(item, dict):
-                    regex = item.get("regex")
-                    weight = item.get("weight", item.get("priority", 1))
-                if not isinstance(regex, str):
-                    continue
-                if not isinstance(weight, int):
-                    weight = 1
-                matches = re.findall(regex, text, re.IGNORECASE)
-                score += len(matches) * weight
+                matches = re.findall(pattern, text, re.IGNORECASE)
+                score += len(matches)
             scores[doc_type] = score
 
         # 返回得分最高的文档类型，如果没有匹配项则返回'unknown'
-        max_type = max(scores, key=lambda k: scores[k]) if scores else 'unknown'
+        max_type = max(scores, key=scores.get) if scores else 'unknown'
         max_score = scores[max_type] if max_type != 'unknown' else 0
 
         # 设置阈值，如果最高得分大于0，则认为是该类型
@@ -139,7 +59,6 @@ class PDFExtractor:
             return ""
         # 去除常见前缀
         text = re.sub(r'^(名称|纳税人识别号|统一社会信用代码)[:：]\s*', '', text)
-        text = re.sub(r'^[：:]\s*', '', text)
         # 去除首尾空白和货币符号
         text = re.sub(r'^[￥¥,\s]+', '', text)
         text = re.sub(r'[￥¥,\s]+$', '', text)
@@ -154,166 +73,6 @@ class PDFExtractor:
         # 匹配：汉字 + 1-3个空格 + 汉字，替换为 汉字+汉字
         # 使用 lookbehind (?<=...) 和 lookahead (?=...) 确保只删除中间的空格
         return re.sub(r'(?<=[\u4e00-\u9fff])\s{1,3}(?=[\u4e00-\u9fff])', '', text)
-
-    def _build_company_names(self, company_records: List[Dict[str, Optional[str]]]) -> List[str]:
-        names: List[str] = []
-        for record in company_records:
-            if not isinstance(record, dict):
-                continue
-            for key in ("full_name", "short_name", "eng_full_name", "eng_short_name"):
-                value = record.get(key)
-                if isinstance(value, str) and value.strip():
-                    names.append(value.strip())
-        return names
-
-    def _is_english_name(self, name: str) -> bool:
-        if not name:
-            return False
-        if re.search(r"[\u4e00-\u9fff]", name):
-            return False
-        if not re.search(r"[A-Za-z]", name):
-            return False
-        return re.fullmatch(r"[A-Za-z][A-Za-z\.\,\s]*[A-Za-z\.\,]", name.strip()) is not None
-
-    def _looks_like_company_name(self, name: str) -> bool:
-        if not name:
-            return False
-        if '公司' in name or '企业' in name or '有限公司' in name:
-            return True
-        return self._is_english_name(name) and len(name.strip()) > 2
-
-    def _is_own_company(self, name: str) -> bool:
-        if not name:
-            return False
-        if not self.company_names:
-            return False
-        return any(company in name for company in self.company_names)
-
-    def _find_own_company_in_text(self, text: str) -> Optional[str]:
-        if not self.company_names:
-            return None
-        if not isinstance(text, str) or not text:
-            return None
-        matches = [name for name in self.company_names if isinstance(name, str) and name and name in text]
-        if not matches:
-            return None
-        return max(matches, key=len)
-
-    def _is_bank_name(self, name: str) -> bool:
-        if not name:
-            return False
-        bank_keywords = self.text_cleanup.get("bank_name_keywords") if isinstance(self.text_cleanup, dict) else None
-        if not isinstance(bank_keywords, list) or not bank_keywords:
-            bank_keywords = ["银行", "分行", "支行", "信用社", "农村商业银行", "商业银行"]
-        return any(keyword in name for keyword in bank_keywords)
-
-    def _extract_counterparty_name(self, text: str) -> Optional[str]:
-        patterns = [
-            r'交易对方名称[:：]?\s*([^\n]{2,60}?)(?=\s+交易对方|\s+对方账号|\s+对方银行|\s+对方行号|$)',
-            r'对方名称[:：]?\s*([^\n]{2,60}?)(?=\s+对方账号|\s+对方银行|\s+对方行号|$)',
-            r'对方户名[:：]?\s*([^\n]{2,60}?)(?=\s+对方账号|\s+对方银行|\s+对方行号|$)',
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
-            if match:
-                result = self._clean_text(match.group(1).strip())
-                if result:
-                    return result
-        return None
-
-    def _trim_bank_receipt_name(self, value: Optional[str]) -> Optional[str]:
-        if not isinstance(value, str):
-            return value
-        trimmed = value
-        cut_keywords = self.text_cleanup.get("bank_receipt_cut_keywords") if isinstance(self.text_cleanup, dict) else None
-        if not isinstance(cut_keywords, list) or not cut_keywords:
-            cut_keywords = [
-                "交易对方",
-                "对方账号",
-                "账号",
-                "行号",
-                "开户行",
-                "银行名称",
-                "银行行号",
-                "收款人名称",
-                "付款人名称",
-                "收款人",
-                "付款人",
-            ]
-        for keyword in cut_keywords:
-            idx = trimmed.find(keyword)
-            if idx > 0:
-                trimmed = trimmed[:idx]
-        trimmed = trimmed.strip()
-        trimmed = re.sub(r'^[：:]\s*', '', trimmed).strip()
-        digit_pos = None
-        for i, ch in enumerate(trimmed):
-            if ch.isdigit():
-                digit_pos = i
-                break
-        if digit_pos is not None and digit_pos >= 3 and re.search(r"[A-Za-z]", trimmed[:digit_pos]):
-            trimmed = trimmed[:digit_pos].strip()
-        trimmed = re.sub(r"(付款|收款)$", "", trimmed).strip()
-        return self._clean_text(trimmed) if trimmed else value
-
-    def _trim_invoice_company_name(self, value: Optional[str]) -> Optional[str]:
-        if not isinstance(value, str):
-            return value
-        trimmed = value.strip()
-        cut_keywords = self.text_cleanup.get("invoice_company_cut_keywords") if isinstance(self.text_cleanup, dict) else None
-        if not isinstance(cut_keywords, list) or not cut_keywords:
-            cut_keywords = [
-                "买售方",
-                "买方",
-                "购方",
-                "购买方",
-                "销方",
-                "销售方",
-                "卖方",
-                "方信",
-                "统一社会信用代码",
-                "纳税人识别号",
-                "地址",
-                "电话",
-                "开户行",
-                "账号",
-                "发票号码",
-                "开票日期",
-                "价税合计",
-                "合计",
-                "税额",
-                "金额",
-            ]
-        for keyword in cut_keywords:
-            idx = trimmed.find(keyword)
-            if idx > 1:
-                trimmed = trimmed[:idx]
-        trimmed = trimmed.strip()
-        trimmed = re.sub(r"[：:]\s*$", "", trimmed).strip()
-        return self._clean_text(trimmed) if trimmed else value
-
-    def _detect_bank_receipt_direction(self, text: str, payer: Optional[str], payee: Optional[str]) -> Optional[str]:
-        if "入账回单" in text:
-            return "in"
-        if "出账回单" in text:
-            return "out"
-        marker2 = re.search(r"收付标志[:：]?\s*([收付])", text)
-        if marker2:
-            return "in" if marker2.group(1) == "收" else "out"
-        marker = re.search(r'借贷标志[:：]?\s*([借贷])', text)
-        if marker:
-            return "out" if marker.group(1) == "借" else "in"
-        payer_is_own = isinstance(payer, str) and self._is_own_company(payer)
-        payee_is_own = isinstance(payee, str) and self._is_own_company(payee)
-        if payer_is_own and not payee_is_own:
-            return "out"
-        if payee_is_own and not payer_is_own:
-            return "in"
-        if "收款" in text and "付款" not in text:
-            return "in"
-        if "付款" in text and "收款" not in text:
-            return "out"
-        return None
 
     def _split_line(self, line: str) -> Tuple[str, str]:
         """将一行按大空格分割为左右两部分"""
@@ -330,8 +89,6 @@ class PDFExtractor:
                 result = match.group(1).strip()
                 logger.debug(f"Pattern {i} matched: {pattern} -> {result}")
                 # 进一步验证结果的合理性
-                if result.endswith((":", "：")):
-                    continue
                 if result and len(result) > 0 and not re.match(r'^[0-9\.\,\-\s]+$', result):
                     return self._clean_text(result)
         return None
@@ -348,12 +105,8 @@ class PDFExtractor:
         for pattern in patterns:
             match = re.search(pattern, text)
             if match and len(match.groups()) >= 2:
-                first = self._clean_text(match.group(1))
-                second = self._clean_text(match.group(2))
-                if self._is_own_company(second) and not self._is_own_company(first):
-                    potential_payer = second
-                else:
-                    potential_payer = first
+                # 第一个通常是购买方(付款方)，第二个是销售方
+                potential_payer = self._clean_text(match.group(1))
                 # 验证是否是有效的公司名称
                 if '公司' in potential_payer or '企业' in potential_payer or '有限公司' in potential_payer:
                     return potential_payer
@@ -387,12 +140,8 @@ class PDFExtractor:
         for pattern in patterns:
             match = re.search(pattern, text)
             if match and len(match.groups()) >= 2:
-                first = self._clean_text(match.group(1))
-                second = self._clean_text(match.group(2))
-                if self._is_own_company(second) and not self._is_own_company(first):
-                    potential_seller = first
-                else:
-                    potential_seller = second
+                # 第二个通常是销售方
+                potential_seller = self._clean_text(match.group(2))
                 # 验证是否是有效的公司名称
                 if '公司' in potential_seller or '企业' in potential_seller or '有限公司' in potential_seller:
                     return potential_seller
@@ -466,32 +215,18 @@ class PDFExtractor:
 
     def extract_amount(self, text: str) -> Optional[str]:
         """提取金额 - 增强版，更准确地识别主要金额"""
-        amount_patterns = self.field_patterns.get("common", {}).get("amount")
-        if isinstance(amount_patterns, list):
-            for pattern in amount_patterns:
-                match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
-                if not match:
-                    continue
-                raw = match.group(1).strip() if match.groups() else ""
-                raw = raw.replace("，", ",")
-                raw = re.sub(r"[￥¥\s,]", "", raw)
-                raw = raw.replace("*", "")
-                if not raw:
-                    continue
-                try:
-                    return f"{float(raw):.2f}"
-                except ValueError:
-                    continue
-
         amounts = self.extract_multiple_amounts(text)
+
         if amounts:
-            return f"{amounts[0]:.2f}"
+            # 对于发票类文档，通常最大金额是总价
+            # 对于其他文档，选择最合理的金额
+            return f"{amounts[0]:.2f}"  # 返回最大金额
         return None
 
     def extract_tax_amount(self, text: str) -> Optional[str]:
         """提取税额 - 从发票文本中提取税额"""
         # 模式1：查找"合 计 ¥金额 ¥税额"格式
-        pattern1 = r'合\s*计\s*[￥¥]?\s*([-]?[\d,，]+\.\d{2})\s*[￥¥]?\s*([-]?[\d,，]+\.\d{2})'
+        pattern1 = r'合\s*计\s*[￥¥]?\s*([\d,，]+\.\d{2})\s*[￥¥]?\s*([\d,，]+\.\d{2})'
         match1 = re.search(pattern1, text)
         if match1:
             # 第二个数字是税额
@@ -503,7 +238,7 @@ class PDFExtractor:
                 pass
         
         # 模式2：查找"税额"字段
-        pattern2 = r'税\s*额\s*[：:]?\s*[￥¥]?\s*([-]?[\d,，]+\.\d{2})'
+        pattern2 = r'税\s*额\s*[：:]?\s*[￥¥]?\s*([\d,，]+\.\d{2})'
         match2 = re.search(pattern2, text)
         if match2:
             tax_amount = match2.group(1)
@@ -518,7 +253,7 @@ class PDFExtractor:
         lines = text.split('\n')
         for line in lines:
             # 查找包含百分比和金额的行，如"13% 9.89"
-            tax_match = re.search(r'\d+%\s+([-]?[\d,，]+\.\d{2})', line)
+            tax_match = re.search(r'\d+%\s+([\d,，]+\.\d{2})', line)
             if tax_match:
                 tax_amount = tax_match.group(1)
                 clean_tax = re.sub(r'[￥¥,\s，]', '', tax_amount)
@@ -536,18 +271,30 @@ class PDFExtractor:
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
                 date_str = match.group(1).strip()
-                normalized = normalize_date_string(date_str)
-                return normalized if isinstance(normalized, str) and normalized else date_str
-        compact = re.search(r'(?:(?:交易日期|日期)[:：]?\s*)?(20\d{2})(\d{2})(\d{2})', text)
-        if compact:
-            normalized = normalize_date_string("".join(compact.groups()))
-            if isinstance(normalized, str) and normalized:
-                return normalized
+                try:
+                    # 标准化日期格式
+                    date_str = re.sub(r'[年月]', '-', date_str)
+                    date_str = re.sub(r'日', '', date_str)
+                    date_str = re.sub(r'[\/_]', '-', date_str)
+                    # 去除所有空格，确保格式为 YYYY-MM-DD
+                    date_str = re.sub(r'\s+', '', date_str)
+                    # 验证日期格式
+                    if re.match(r'^\d{4}-\d{1,2}-\d{1,2}$', date_str):
+                        # 确保月份和日期是两位数
+                        parts = date_str.split('-')
+                        if len(parts) == 3:
+                            year, month, day = parts
+                            month = month.zfill(2)
+                            day = day.zfill(2)
+                            return f"{year}-{month}-{day}"
+                    return date_str
+                except:
+                    return date_str
         return None
 
     def extract_invoice_fields(self, text: str) -> Dict[str, Optional[str]]:
         """提取发票特有字段，专门处理左右分栏布局 - 增强版"""
-        fields: Dict[str, Optional[str]] = {
+        fields = {
             'seller': None,
             'seller_tax_id': None,
             'project_name': None,
@@ -570,20 +317,16 @@ class PDFExtractor:
                 # 尝试从分割后的文本中提取名称
                 if '购' in left or '买方' in left:
                     m = re.search(r'(?:购货)?(?:买方|方|单位|名称)[:：]?\s*([^\s]{2,30})', left)
-                    if m:
-                        fields['payer'] = m.group(1)
+                    if m: fields['payer'] = m.group(1)
                 if '销' in right or '卖方' in right or '销售方' in right:
                     m = re.search(r'销售方[:：]?\s*([^\s]{2,30})', right)
-                    if m:
-                        fields['seller'] = m.group(1)
+                    if m: fields['seller'] = m.group(1)
             elif '销售方' in line and '名称' in line:
                 m = re.search(r'销售方[:：]?\s*([^\n]{5,60})', line)
-                if m:
-                    fields['seller'] = self._clean_text(m.group(1))
+                if m: fields['seller'] = self._clean_text(m.group(1))
             elif '购买方' in line and '名称' in line:
                 m = re.search(r'购买方[:：]?\s*([^\n]{5,60})', line)
-                if m:
-                    fields['payer'] = self._clean_text(m.group(1))
+                if m: fields['payer'] = self._clean_text(m.group(1))
 
             # 特殊处理左右分栏的购销名称行
             if '购' in line and '销' in line and ('名称' in line or '方' in line):
@@ -657,17 +400,14 @@ class PDFExtractor:
                 # 如果行以*开头，很可能是项目名称
                 if line.startswith('*'):
                     # 提取两个*之间的内容，或者直接取整行（截断到数字）
-                    if line.count('*') >= 2:
-                        fields['project_name'] = clean_project_name(line)
+                    m = re.search(r'\*([^*]+)\*', line)
+                    if m:
+                        fields['project_name'] = m.group(1)
                     else:
-                        m = re.search(r'\*([^*]+)\*', line)
-                        if m:
-                            fields['project_name'] = clean_project_name(m.group(1))
-                        else:
-                            # 取第一个非数字非标点词汇
-                            parts = re.findall(r'[\u4e00-\u9fff\w]+', line)
-                            if parts:
-                                fields['project_name'] = clean_project_name(parts[0])
+                        # 取第一个非数字非标点词汇
+                        parts = re.findall(r'[\u4e00-\u9fff\w]+', line)
+                        if parts:
+                            fields['project_name'] = parts[0]
                 else:
                      # 查找中文词语，排除金额和数字
                      chinese_words = re.findall(r'[\u4e00-\u9fff\w]+', line)
@@ -675,13 +415,12 @@ class PDFExtractor:
                      valid_words = [word for word in chinese_words
                                    if len(word) > 1 and not re.match(r'^\d+\.?\d*$', word)]
                      if valid_words:
-                         fields['project_name'] = clean_project_name(valid_words[0])
+                         fields['project_name'] = valid_words[0]
 
         # 如果循环结束后仍未找到，尝试使用通用正则作为兜底
         if not fields['seller']:
             m = re.search(r'(?:销\s*售\s*方|销方|销售单位)[:：]?\s*([^\n]{5,60})', text)
-            if m:
-                fields['seller'] = self._clean_text(m.group(1))
+            if m: fields['seller'] = self._clean_text(m.group(1))
 
         # 再次尝试提取销售方和销售方税号，使用更多模式
         if not fields['seller']:
@@ -727,7 +466,7 @@ class PDFExtractor:
             'currency': self.extract_currency(text)
         }
 
-    def extract_pdf_info(self, pdf_path: str) -> Dict[str, Any]:
+    def extract_pdf_info(self, pdf_path: str) -> Dict:
         """主函数：提取PDF信息 - 增强版"""
         try:
             text = self.ocr_engine.extract_text(pdf_path)
@@ -739,8 +478,6 @@ class PDFExtractor:
     def extract_currency(self, text: str) -> Optional[str]:
         if re.search(r'人民币|RMB|[￥¥]', text, re.IGNORECASE):
             return 'CNY'
-        if re.search(r'CNY', text, re.IGNORECASE):
-            return 'CNY'
         if re.search(r'美元|USD|\$', text, re.IGNORECASE):
             return 'USD'
         if re.search(r'港币|HKD', text, re.IGNORECASE):
@@ -749,7 +486,7 @@ class PDFExtractor:
             return 'EUR'
         return None
 
-    def extract_pdf_info_from_text(self, text: str) -> Dict[str, Any]:
+    def extract_pdf_info_from_text(self, text: str) -> Dict:
         try:
             if not text or len(text.strip()) < 10:
                 return {'error': '无法从PDF中提取有效文本'}
@@ -760,16 +497,15 @@ class PDFExtractor:
             doc_type = self.detect_document_type(text)
             cleaned_text = re.sub(r'[ \t]+', ' ', text)
             cleaned_text = re.sub(r'\n\s*\n', '\n', cleaned_text)
-            result: Dict[str, Any] = {
+            result = {
                 'document_type': doc_type,
                 'extracted_text': cleaned_text[:1000] + '...' if len(cleaned_text) > 1000 else cleaned_text
             }
             common_fields = self.extract_common_fields(text)
-            for key, value in common_fields.items():
-                result[key] = value
+            result.update(common_fields)
             if doc_type == 'invoice':
-                is_red_invoice = re.search(r'红冲', text) is not None
-                result['document_type'] = 'VAT_invalid_invoice' if is_red_invoice else 'VAT_invoice'
+                # 修改document_type为VAT_invoice
+                result['document_type'] = 'VAT_invoice'
                 
                 # 提取税额
                 tax_amount = self.extract_tax_amount(text)
@@ -789,25 +525,11 @@ class PDFExtractor:
                     result['payer'] = self.extract_payer_from_invoice_layout(text)
                 if result.get('seller') is None:
                     result['seller'] = self.extract_seller_from_invoice_layout(text)
-                if result.get('payer'):
-                    result['payer'] = self._trim_invoice_company_name(result.get('payer'))
-                if result.get('seller'):
-                    result['seller'] = self._trim_invoice_company_name(result.get('seller'))
                 if result.get('uid') is None:
                     result['uid'] = common_fields.get('uid') or invoice_fields.get('uid')
                 for key, value in invoice_fields.items():
                     if value is not None:
                         result[key] = value
-                if result.get('payer'):
-                    result['payer'] = self._trim_invoice_company_name(result.get('payer'))
-                if result.get('seller'):
-                    result['seller'] = self._trim_invoice_company_name(result.get('seller'))
-                if result.get('project_name'):
-                    result['project_name'] = clean_project_name(result.get('project_name'))
-                if result.get('document_type') == 'VAT_invalid_invoice':
-                    reconcile_vat_num = extract_reconcile_vat_num(text)
-                    if reconcile_vat_num:
-                        result['reconcile_VAT_num'] = reconcile_vat_num
                 if result.get('seller') is None:
                     seller_pattern = r'销售方[^\n]*[:：]?\s*([^\n]{5,60})'
                     seller_match = re.search(seller_pattern, text)
@@ -837,7 +559,7 @@ class PDFExtractor:
                 if not result.get('amount'):
                     result['amount'] = self.extract_amount_from_digital_format(text)
                 if not result.get('uid'):
-                    receipt_no_pattern = r'回单流水号[:：]?\s*([A-Za-z0-9]{8,30}[!$?]?)|交易流水号[:：]?\s*([A-Za-z0-9]{8,30}[!$?]?)|交易流水[:：]?\s*([A-Za-z0-9]{8,30}[!$?]?)|业务流水号[:：]?\s*([A-Za-z0-9]{8,30}[!$?]?)|回单编码[:：]?\s*([A-Za-z0-9]{8,30}[!$?]?)|回单编号[:：]?\s*([A-Za-z0-9]{8,30}[!$?]?)|业务唯一编号[:：]?\s*(\d{12,30})'
+                    receipt_no_pattern = r'回单流水号[:：]?\s*([A-Za-z0-9]{8,30})|交易流水号[:：]?\s*([A-Za-z0-9]{8,30})|业务流水号[:：]?\s*([A-Za-z0-9]{8,30})'
                     receipt_no_match = re.search(receipt_no_pattern, text)
                     if receipt_no_match:
                         for group in receipt_no_match.groups():
@@ -883,15 +605,6 @@ class PDFExtractor:
         if not fields.get('payer'):
             fields['payer'] = self.extract_field(text, self.field_patterns['common']['payer'])
 
-        counterparty_name = self._extract_counterparty_name(text)
-        if counterparty_name and (not fields.get('payee') or self._is_bank_name(fields.get('payee') or "")):
-            fields['payee'] = counterparty_name
-
-        if fields.get('payer'):
-            fields['payer'] = self._trim_bank_receipt_name(fields.get('payer'))
-        if fields.get('payee'):
-            fields['payee'] = self._trim_bank_receipt_name(fields.get('payee'))
-
         # 如果没有提取到收款方，尝试其他模式
         if not fields['payee']:
             # 银行水单中收款方的其他可能表述
@@ -928,11 +641,12 @@ class PDFExtractor:
                     else:
                         result = match.group(1).strip()
 
-                    if result and len(result) > 0:
-                        cleaned = self._clean_text(result)
-                        if cleaned and self._looks_like_company_name(cleaned):
-                            fields['payee'] = cleaned
-                            break
+                    if result and len(result) > 0 and '北京华诚邦友劳务服务有限公司' in result:
+                        fields['payee'] = self._clean_text(result)
+                        break
+                    elif result and len(result) > 0 and '北京' in result and '公司' in result:
+                        fields['payee'] = self._clean_text(result)
+                        break
 
         # 特别针对示例中的模式
         if not fields['payee']:
@@ -966,60 +680,25 @@ class PDFExtractor:
                         second_name = self._clean_text(groups[1].strip())
 
                         # 一般情况下第一行是付款方，第二行是收款方
-                        if self._looks_like_company_name(first_name):
+                        if '北京磐沄科技有限公司' in first_name or '公司' in first_name and len(first_name) > 5:
                             fields['payer'] = first_name
-                        if self._looks_like_company_name(second_name):
+                        if '公司' in second_name and len(second_name) > 5:
                             fields['payee'] = second_name
                     else:
                         # 只有一组匹配
                         name = self._clean_text(match.group(1).strip())
-                        if self._looks_like_company_name(name):
+                        if '北京磐沄科技有限公司' in name or ('公司' in name and len(name) > 5):
                             fields['payer'] = name
                     break
-
-        tax_keywords = self.text_cleanup.get("bank_receipt_tax_keywords") if isinstance(self.text_cleanup, dict) else None
-        if not isinstance(tax_keywords, list) or not tax_keywords:
-            tax_keywords = ["税"]
-        tax_hit = any(isinstance(keyword, str) and keyword in text for keyword in tax_keywords)
-        if tax_hit:
-            own_company = self._find_own_company_in_text(text)
-            if own_company:
-                original_payer = fields.get("payer")
-                original_payee = fields.get("payee")
-                fields["payer"] = own_company
-                other = None
-                if isinstance(original_payee, str) and own_company not in original_payee:
-                    other = original_payee
-                elif isinstance(original_payer, str) and own_company not in original_payer:
-                    other = original_payer
-                if not other:
-                    counterparty_name = self._extract_counterparty_name(text)
-                    if isinstance(counterparty_name, str) and own_company not in counterparty_name:
-                        other = counterparty_name
-                if other:
-                    fields["payee"] = other
-
-        direction = self._detect_bank_receipt_direction(text, fields.get('payer'), fields.get('payee'))
-        if direction:
-            fields['direction'] = direction
-            if direction == "in":
-                payee = fields.get("payee")
-                if not (isinstance(payee, str) and self._is_own_company(payee)):
-                    own_company = self._find_own_company_in_text(text)
-                    if own_company:
-                        fields["payee"] = own_company
-            elif direction == "out":
-                payer = fields.get("payer")
-                if not (isinstance(payer, str) and self._is_own_company(payer)):
-                    own_company = self._find_own_company_in_text(text)
-                    if own_company:
-                        fields["payer"] = own_company
 
         return fields
 
     def extract_tax_certificate_fields(self, text: str) -> Dict[str, Optional[str]]:
         """提取完税证明特有字段 - 增强版"""
-        fields: Dict[str, Optional[str]] = {}
+        patterns = self.field_patterns['tax_certificate']
+        fields = {
+            'tax_authority': self.extract_field(text, patterns['tax_authority'])
+        }
 
         # 提取纳税人名称（作为payer）
         # 注意：通用字段提取已经涵盖了纳税人名称的提取，且逻辑更完善
@@ -1083,24 +762,39 @@ class PDFExtractor:
             # 也尝试原始的uid模式
             fields['uid'] = self.extract_field(text, self.field_patterns['common']['uid'])
 
+        # 如果没有找到税务机关，尝试其他模式
+        if not fields['tax_authority']:
+            alt_patterns = [
+                r'主管.*税务.*机关[:：]?\s*([^\n]{5,60})',
+                r'征收.*机关[:：]?\s*([^\n]{5,60})',
+                r'税务.*机关[:：]?\s*([^\n]{5,60})',
+                r'征收单位[:：]?\s*([^\n]{5,60})'
+            ]
+            for pattern in alt_patterns:
+                match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
+                if match:
+                    result = match.group(1).strip()
+                    if result and len(result) > 0:
+                        fields['tax_authority'] = self._clean_text(result)
+                        break
+
         return fields
 
-def process_single_pdf(
-    pdf_path: Path, output_dir: Optional[str] = None, extractor: Optional[PDFExtractor] = None
-) -> Tuple[str, Dict[str, Any]]:
+def process_single_pdf(pdf_path, output_dir=None, extractor=None):
     """处理单个PDF文件的辅助函数"""
     try:
         extractor = extractor or PDFExtractor()
         result = extractor.extract_pdf_info(str(pdf_path))
         # 修改：默认输出目录改为项目根目录下的temp目录
-        target_dir: Path
         if output_dir is None:
-            target_dir = get_project_root() / "temp"
+            # 获取项目根目录并创建temp目录
+            project_root = Path(__file__).parent.parent
+            output_dir = project_root / "temp"
         else:
-            target_dir = Path(output_dir)
-
-        target_dir.mkdir(parents=True, exist_ok=True)
-        output_file = target_dir / f"{Path(pdf_path).stem}_extracted_revised.json"
+            output_dir = Path(output_dir)
+        
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_file = output_dir / f"{Path(pdf_path).stem}_extracted_revised.json"
         with open(output_file, 'w', encoding='utf-8') as f:
             json.dump(result, f, ensure_ascii=False, indent=2)
 
@@ -1111,14 +805,9 @@ def process_single_pdf(
         return Path(pdf_path).name, result
 
 
-def process_pdfs_multithread(
-    pdf_paths: Iterable[Path],
-    max_workers: int = 4,
-    output_dir: Optional[str] = None,
-    extractor: Optional[PDFExtractor] = None,
-) -> Dict[str, Dict[str, Any]]:
+def process_pdfs_multithread(pdf_paths, max_workers=4, output_dir=None, extractor=None):
     """多线程处理多个PDF文件"""
-    results: Dict[str, Dict[str, Any]] = {}
+    results = {}
     extractor = extractor or PDFExtractor()
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -1135,15 +824,16 @@ def process_pdfs_multithread(
     return results
 
 
-def process_pdfs_sequentially(pdf_paths: Iterable[Path], output_dir: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+def process_pdfs_sequentially(pdf_paths, output_dir=None):
     """顺序处理多个PDF文件（备用方案）"""
-    results: Dict[str, Dict[str, Any]] = {}
+    results = {}
     extractor = PDFExtractor()
 
     # 修改：确定输出目录
     if output_dir is None:
         # 获取项目根目录并创建temp目录
-        target_dir = get_project_root() / "temp"
+        project_root = Path(__file__).parent.parent
+        target_dir = project_root / "temp"
     else:
         target_dir = Path(output_dir)
     
@@ -1166,7 +856,7 @@ def process_pdfs_sequentially(pdf_paths: Iterable[Path], output_dir: Optional[st
     return results
 
 
-def main() -> None:
+def main():
     if len(sys.argv) == 1:
         test_file = "test.pdf"
         if os.path.exists(test_file):

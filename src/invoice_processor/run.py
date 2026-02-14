@@ -17,8 +17,14 @@ def main():
         sys.exit(1)
 
     # Construct the command
-    cmd = [sys.executable, main_script] + sys.argv[1:]
+    cmd = [sys.executable, "-X", "utf8", main_script] + sys.argv[1:]
     
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
     print("Starting Invoice Processor...")
     print(f"Target: {main_script}")
     print("-" * 40)

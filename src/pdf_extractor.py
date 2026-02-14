@@ -1,7 +1,6 @@
 import json
 import re
 import logging
-from datetime import datetime
 from typing import Dict, Optional, List, Tuple
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -30,8 +29,6 @@ class PDFExtractor:
 
     def detect_document_type(self, text: str) -> str:
         """基于文本内容检测文档类型 - 增强版"""
-        text_lower = text.lower()  # 转换为小写便于匹配
-
         # 按优先级检查文档类型
         scores = {}
 
@@ -288,7 +285,7 @@ class PDFExtractor:
                             day = day.zfill(2)
                             return f"{year}-{month}-{day}"
                     return date_str
-                except:
+                except Exception:
                     return date_str
         return None
 
@@ -317,16 +314,20 @@ class PDFExtractor:
                 # 尝试从分割后的文本中提取名称
                 if '购' in left or '买方' in left:
                     m = re.search(r'(?:购货)?(?:买方|方|单位|名称)[:：]?\s*([^\s]{2,30})', left)
-                    if m: fields['payer'] = m.group(1)
+                    if m:
+                        fields['payer'] = m.group(1)
                 if '销' in right or '卖方' in right or '销售方' in right:
                     m = re.search(r'销售方[:：]?\s*([^\s]{2,30})', right)
-                    if m: fields['seller'] = m.group(1)
+                    if m:
+                        fields['seller'] = m.group(1)
             elif '销售方' in line and '名称' in line:
                 m = re.search(r'销售方[:：]?\s*([^\n]{5,60})', line)
-                if m: fields['seller'] = self._clean_text(m.group(1))
+                if m:
+                    fields['seller'] = self._clean_text(m.group(1))
             elif '购买方' in line and '名称' in line:
                 m = re.search(r'购买方[:：]?\s*([^\n]{5,60})', line)
-                if m: fields['payer'] = self._clean_text(m.group(1))
+                if m:
+                    fields['payer'] = self._clean_text(m.group(1))
 
             # 特殊处理左右分栏的购销名称行
             if '购' in line and '销' in line and ('名称' in line or '方' in line):
@@ -420,7 +421,8 @@ class PDFExtractor:
         # 如果循环结束后仍未找到，尝试使用通用正则作为兜底
         if not fields['seller']:
             m = re.search(r'(?:销\s*售\s*方|销方|销售单位)[:：]?\s*([^\n]{5,60})', text)
-            if m: fields['seller'] = self._clean_text(m.group(1))
+            if m:
+                fields['seller'] = self._clean_text(m.group(1))
 
         # 再次尝试提取销售方和销售方税号，使用更多模式
         if not fields['seller']:

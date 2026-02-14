@@ -4,8 +4,11 @@ $env:PYTHONUTF8 = '1'
 $env:PYTHONIOENCODING = 'utf-8'
 
 $projectRoot = $PSScriptRoot
-$venvDir = Join-Path $projectRoot '.venv'
+$localRoot = Join-Path $env:LocalAppData 'ExpensifyAuto'
+$venvDir = Join-Path $localRoot '.venv'
 $venvPython = Join-Path $venvDir 'Scripts\python.exe'
+$venvPathFile = Join-Path $projectRoot '.venv_path'
+$pythonPathFile = Join-Path $projectRoot '.python_path'
 
 function Get-Python311 {
   $candidates = @(
@@ -53,6 +56,53 @@ function Ensure-Python311 {
   return $python
 }
 
+function Resolve-PythonPath {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Python
+  )
+  if ($Python -eq 'py -3.11') {
+    $resolved = & py -3.11 -c "import sys;print(sys.executable)"
+    if ($LASTEXITCODE -ne 0 -or -not $resolved) {
+      return $null
+    }
+    return $resolved.Trim()
+  }
+  if (-not (Test-Path $Python)) {
+    return $null
+  }
+  return $Python
+}
+
+function Get-MissingModules {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Python,
+    [Parameter(Mandatory = $true)]
+    [string[]]$Modules
+  )
+  $modulesStr = $Modules -join ','
+  $code = "import importlib.util;mods='$modulesStr'.split(',');missing=[m for m in mods if m and importlib.util.find_spec(m) is None];print(','.join(missing))"
+  $result = & $Python -c $code
+  if ($LASTEXITCODE -ne 0) {
+    return @()
+  }
+  if (-not $result) {
+    return @()
+  }
+  return $result.Trim().Split(',', [System.StringSplitOptions]::RemoveEmptyEntries)
+}
+
+function Map-ModuleToPackage {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Module
+  )
+  if ($Module -eq 'PIL') { return 'Pillow' }
+  if ($Module -eq 'dotenv') { return 'python-dotenv' }
+  return $Module
+}
+
 function New-Venv {
   param(
     [Parameter(Mandatory = $true)]
@@ -87,10 +137,81 @@ function Ensure-VenvPip {
 }
 
 function Install-Requirements {
-  & $venvPython -m pip install -r (Join-Path $projectRoot 'requirements.txt')
-  if ($LASTEXITCODE -ne 0) {
-    throw 'pip install -r requirements.txt failed.'
+  $reqPath = Join-Path $projectRoot 'requirements.txt'
+  $lines = Get-Content $reqPath
+  if (-not $lines) {
+    throw 'requirements.txt does not contain installable packages.'
   }
+
+  # Configure pip to use Aliyun mirror for better connectivity in China
+  Write-Host "Configuring pip to use Aliyun mirror..."
+  & $venvPython -m pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/
+  & $venvPython -m pip config set install.trusted-host mirrors.aliyun.com
+
+  $optional = @('paddleocr', 'paddlepaddle')
+  $core = $lines | Where-Object {
+    $line = $_.Trim()
+    if (-not $line -or $line.StartsWith('#')) { return $false }
+    $keep = $true
+    foreach ($opt in $optional) {
+      if ($line -match ("^" + [Regex]::Escape($opt))) { $keep = $false }
+    }
+    $keep
+  }
+
+  Write-Host "Installing core requirements..."
+  if ($core) {
+      & $venvPython -m pip install $core
+      if ($LASTEXITCODE -ne 0) {
+        throw 'pip install core requirements failed.'
+      }
+  }
+
+  $answer = Read-Host "Install optional packages (paddleocr/paddlepaddle)? (Y/N)"
+  if ($answer -match '^(y|Y)') {
+    $optionalLines = $lines | Where-Object {
+      $line = $_.Trim()
+      if (-not $line -or $line.StartsWith('#')) { return $false }
+      $line -match '^paddleocr' -or $line -match '^paddlepaddle'
+    }
+    if ($optionalLines) {
+      Write-Host "Installing optional requirements..."
+      & $venvPython -m pip install $optionalLines
+    }
+  }
+}
+
+function Write-VenvPath {
+  if (-not (Test-Path $localRoot)) {
+    New-Item -ItemType Directory -Path $localRoot | Out-Null
+  }
+  # Use UTF-8 without BOM to ensure batch scripts can read it correctly even with chcp 65001
+  $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+  [System.IO.File]::WriteAllText($venvPathFile, $venvPython, $utf8NoBom)
+}
+
+function Write-PythonPath {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Python
+  )
+  $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+  [System.IO.File]::WriteAllText($pythonPathFile, $Python, $utf8NoBom)
+}
+
+function Install-Modules {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Python,
+    [Parameter(Mandatory = $true)]
+    [string[]]$Modules
+  )
+  $packages = @()
+  foreach ($mod in $Modules) {
+    $packages += (Map-ModuleToPackage -Module $mod)
+  }
+  & $Python -m pip install @packages
+  return ($LASTEXITCODE -eq 0)
 }
 
 function Check-SystemDeps {
@@ -101,18 +222,55 @@ function Check-SystemDeps {
 }
 
 $python311 = Ensure-Python311
-New-Venv -Python $python311
-if (-not (Ensure-VenvPip)) {
-  Remove-Venv
-  New-Venv -Python $python311
-  if (-not (Ensure-VenvPip)) {
-    throw 'pip is not available in the virtual environment.'
+$resolvedPython = Resolve-PythonPath -Python $python311
+$systemPython = $resolvedPython
+$requiredModules = @('paddleocr', 'paddlepaddle', 'pdfplumber', 'pdf2image', 'PIL', 'dotenv', 'openai', 'ruff', 'mypy')
+$smallModules = @('pdfplumber', 'pdf2image', 'PIL', 'dotenv', 'openai', 'ruff', 'mypy')
+$largeModules = @('paddleocr', 'paddlepaddle')
+
+$useVenv = $true
+if ($systemPython) {
+  Write-Host ("Local Python: " + $systemPython)
+  $missing = Get-MissingModules -Python $systemPython -Modules $requiredModules
+  if ($missing -and $missing.Count -gt 0) {
+    Write-Host ("Missing modules: " + ($missing -join ', '))
+  }
+  if (-not $missing -or $missing.Count -eq 0) {
+    Write-PythonPath -Python $systemPython
+    $useVenv = $false
+  } else {
+    $missingLarge = $missing | Where-Object { $largeModules -contains $_ }
+    $missingSmall = $missing | Where-Object { $smallModules -contains $_ }
+    if ($missingLarge.Count -eq 0 -and $missingSmall.Count -gt 0) {
+      $answer = Read-Host "Local Python missing modules: $($missingSmall -join ', '). Install to local Python? (Y/N)"
+      if ($answer -match '^(y|Y)') {
+        if (Install-Modules -Python $systemPython -Modules $missingSmall) {
+          Write-PythonPath -Python $systemPython
+          $useVenv = $false
+        }
+      }
+    }
   }
 }
-Install-Requirements
+
+if ($useVenv) {
+  New-Venv -Python $python311
+  if (-not (Ensure-VenvPip)) {
+    Remove-Venv
+    New-Venv -Python $python311
+    if (-not (Ensure-VenvPip)) {
+      throw 'pip is not available in the virtual environment.'
+    }
+  }
+  Write-VenvPath
+  Write-PythonPath -Python $venvPython
+  Install-Requirements
+}
+
 Check-SystemDeps
 
 Write-Host ''
 Write-Host 'Setup completed.'
+Write-Host ('- python: ' + (Get-Content $pythonPathFile))
 Write-Host ('- venv: ' + $venvDir)
-Write-Host ('- example: ' + (Join-Path $venvDir 'Scripts\python.exe') + ' src\pdf_extractor.py <pdf-or-folder> --output-dir temp')
+Write-Host ('- example: ' + (Get-Content $pythonPathFile) + ' src\pdf_extractor.py <pdf-or-folder> --output-dir temp')

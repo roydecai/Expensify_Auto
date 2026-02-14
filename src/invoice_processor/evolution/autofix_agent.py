@@ -93,11 +93,11 @@ def _load_ark_settings(default_model: str) -> Dict[str, str]:
 
 
 def _create_ark_client(base_url: str, api_key: str) -> Any:
-    mod = importlib.import_module("volcenginesdkarkruntime")
-    ark_cls = getattr(mod, "Ark", None)
-    if not callable(ark_cls):
-        raise RuntimeError("volcenginesdkarkruntime.Ark 不可用")
-    return ark_cls(base_url=base_url, api_key=api_key)
+    mod = importlib.import_module("openai")
+    openai_cls = getattr(mod, "OpenAI", None)
+    if not callable(openai_cls):
+        raise RuntimeError("openai.OpenAI 不可用")
+    return openai_cls(base_url=base_url, api_key=api_key)
 
 
 def _load_mutations(path: Path) -> List[Dict[str, Any]]:
@@ -269,8 +269,18 @@ def _generate_llm_mutations(
         return []
     client = _create_ark_client(settings["base_url"], settings["api_key"])
     messages = _build_llm_messages(reports, max_cases=max_cases, preview_len=preview_len)
-    response = client.responses.create(model=settings["model"], input=messages)
-    mutations = _extract_mutations_from_response(response)
+    
+    # 使用 OpenAI 兼容接口: chat.completions.create
+    try:
+        response = client.chat.completions.create(
+            model=settings["model"],
+            messages=messages,
+        )
+        content = response.choices[0].message.content
+    except Exception:
+        content = ""
+        
+    mutations = _extract_mutations_from_response(content)
     unique = []
     seen = set()
     for item in mutations:

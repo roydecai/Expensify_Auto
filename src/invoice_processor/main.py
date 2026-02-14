@@ -59,6 +59,16 @@ def _write_json(path: Path, payload: Any) -> None:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
+def _ai_status_path(json_dir: Path) -> Path:
+    return json_dir / "ai_iteration_status.json"
+
+
+def _write_ai_iteration_status(json_dir: Path, payload: Dict[str, Any]) -> Optional[Path]:
+    path = _ai_status_path(json_dir)
+    _write_json(path, payload)
+    return path
+
+
 def _read_json(path: Path) -> Any:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -512,11 +522,11 @@ def _load_ark_settings(default_model: str) -> Dict[str, str]:
 
 
 def _create_ark_client(base_url: str, api_key: str) -> Any:
-    mod = importlib.import_module("volcenginesdkarkruntime")
-    ark_cls = getattr(mod, "Ark", None)
-    if not callable(ark_cls):
-        raise RuntimeError("volcenginesdkarkruntime.Ark 不可用")
-    return ark_cls(base_url=base_url, api_key=api_key)
+    mod = importlib.import_module("openai")
+    openai_cls = getattr(mod, "OpenAI", None)
+    if not callable(openai_cls):
+        raise RuntimeError("openai.OpenAI 不可用")
+    return openai_cls(base_url=base_url, api_key=api_key)
 
 
 def _apply_llm_fix(
@@ -546,9 +556,10 @@ def _apply_llm_fix(
 
     call_start = time.perf_counter()
     try:
-        response = client.responses.create(
+        # 使用 OpenAI 兼容接口: chat.completions.create
+        response = client.chat.completions.create(
             model=model,
-            input=fix_input.get("messages"),
+            messages=fix_input.get("messages"),
         )
     except Exception as exc:
         call_seconds = time.perf_counter() - call_start
@@ -562,9 +573,15 @@ def _apply_llm_fix(
         }
     call_seconds = time.perf_counter() - call_start
 
-    parsed = _extract_json_from_response(response)
+    # 从 OpenAI response 中提取 content
+    try:
+        content = response.choices[0].message.content
+    except Exception:
+        content = ""
+
+    parsed = _parse_json_from_text(content)
     if parsed is None:
-        response_text = _truncate_text(_extract_longest_text(response), 2000)
+        response_text = _truncate_text(content, 2000)
         total_seconds = time.perf_counter() - total_start
         return {
             "json_filename": json_filename,
@@ -666,7 +683,13 @@ def main() -> None:
 
         fix_inputs: List[Dict[str, Any]] = []
         llm_results: List[Dict[str, Any]] = []
-        should_apply_llm = bool(args.apply_llm or args.auto_apply_llm)
+        llm_enabled = bool(args.apply_llm or args.auto_apply_llm)
+        should_apply_llm = llm_enabled
+        ai_status = "DISABLED"
+        ai_autofix_attempted = False
+        ai_autofix_status: Optional[str] = None
+        if llm_enabled:
+            ai_status = "ENABLED"
         fix_path = Path(args.fix_prompts_path) if args.fix_prompts_path else (input_path / "llm_fix_inputs.json")
         results_path = (
             Path(args.llm_results_path) if args.llm_results_path else (input_path / "llm_fix_results.json")
@@ -704,6 +727,7 @@ def main() -> None:
                     )
                     report["errors"] = error_list
                     report["status"] = "FAIL_HUMAN"
+                ai_status = "DISABLED_MISSING_KEY"
                 should_apply_llm = False
             else:
                 client = _create_ark_client(settings["base_url"], settings["api_key"])
@@ -797,8 +821,14 @@ def main() -> None:
                     model=args.model,
                 )
                 logger.info(f"自动迭代结果: {result.get('status')}")
+                ai_autofix_attempted = True
+                ai_autofix_status = result.get("status") if isinstance(result, dict) else None
+                ai_status = "AUTOFIX_ATTEMPTED"
             except Exception:
                 logger.exception("自动迭代失败")
+                ai_autofix_attempted = True
+                ai_autofix_status = "error"
+                ai_status = "AUTOFIX_FAILED"
 
         if should_apply_llm and reports:
             for report in reports:
@@ -831,6 +861,16 @@ def main() -> None:
             logger.info(f"已写入修复提示词输入: {len(fix_inputs)} 个 -> {fix_path}")
         if should_apply_llm and llm_results:
             logger.info(f"已写入修复结果: {len(llm_results)} 个 -> {results_path}")
+        ai_payload = {
+            "enabled": llm_enabled,
+            "status": ai_status,
+            "autofix_attempted": ai_autofix_attempted,
+            "autofix_status": ai_autofix_status,
+            "llm_rounds": llm_round,
+            "fail_llm_remaining": summary.get("fail_llm"),
+        }
+        _write_ai_iteration_status(input_path, ai_payload)
+        print(f"AI_ITERATION_STATUS={ai_status}")
         return
 
     if not input_path.exists():

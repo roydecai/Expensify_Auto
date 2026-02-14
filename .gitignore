@@ -37,3 +37,8 @@ training_data/
 pdf_extraction_analysis_report.md
 test.py
 invoice_to_proceed/
+invoice_to_submit/
+logs/
+.python_path
+.venv_path
+src/invoice_processor/temp/

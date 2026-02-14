@@ -778,6 +778,8 @@ def main() -> None:
                     result = future.result()
                     if isinstance(result, dict):
                         result["llm_round"] = llm_round
+                        if "json_filename" in result:
+                            logger.info(f"LLM 任务完成: {result['json_filename']}")
                     llm_results.append(result)
 
             summary, reports = validate_dir(input_path, spec, extracted_text_preview_len=args.preview_len)

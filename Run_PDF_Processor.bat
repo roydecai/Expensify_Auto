@@ -4,7 +4,8 @@ setlocal EnableExtensions EnableDelayedExpansion
 cd /d "%~dp0"
 set SOURCE_DIR=invoice_to_proceed
 set TARGET_DIR=invoice_to_submit
-set LOG_DIR=temp
+set LOG_DIR=logs
+set OUTPUT_DIR=temp
 set PYTHONUTF8=1
 set PYTHONIOENCODING=utf-8
 set PYTHON=
@@ -40,12 +41,12 @@ if not defined PYTHON (
     pause
     exit /b 2
 )
-echo Using Python: %PYTHON%
-echo [%date% %time%] Runner started > "%LOG_DIR%\runner.log"
-
 if not exist "%SOURCE_DIR%" mkdir "%SOURCE_DIR%"
 if not exist "%TARGET_DIR%" mkdir "%TARGET_DIR%"
 if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"
+
+echo Using Python: %PYTHON%
+echo [%date% %time%] Runner started > "%LOG_DIR%\runner.log"
 
 :loop
 set FOUND_PDF=0
@@ -56,7 +57,7 @@ for /f "delims=" %%F in ('dir /s /b "%SOURCE_DIR%\*.pdf" 2^>nul') do (
 :after_scan
 if "!FOUND_PDF!"=="1" (
     echo [%date% %time%] PDF detected >> "%LOG_DIR%\runner.log"
-    call "%PYTHON%" "src\invoice_processor\run.py" "%SOURCE_DIR%" > "%LOG_DIR%\pdf_processor.log" 2>&1
+    call "%PYTHON%" "src\gui_runner.py" "%SOURCE_DIR%" --output-dir "%OUTPUT_DIR%" --log-file "%LOG_DIR%\pdf_processor.log"
     set EXITCODE=!ERRORLEVEL!
     if !EXITCODE! NEQ 0 (
         echo Execution failed with error code !EXITCODE!.
@@ -64,20 +65,7 @@ if "!FOUND_PDF!"=="1" (
         type "%LOG_DIR%\pdf_processor.log"
         pause
     )
-    if exist "%LOG_DIR%\pdf_processor.log" (
-        findstr /C:"AI_ITERATION_STATUS=AUTOFIX_ATTEMPTED" "%LOG_DIR%\pdf_processor.log" >nul
-        if errorlevel 1 (
-            findstr /C:"AI_ITERATION_STATUS=ENABLED" "%LOG_DIR%\pdf_processor.log" >nul
-            if errorlevel 1 (
-                findstr /C:"AI_ITERATION_STATUS=DISABLED_MISSING_KEY" "%LOG_DIR%\pdf_processor.log" >nul
-                if not errorlevel 1 (
-                    echo AI iteration disabled due to missing key.
-                ) else (
-                    echo AI iteration status not confirmed.
-                )
-            )
-        )
-    )
+    
     call "%PYTHON%" "src\folder_transfer\run.py" "%SOURCE_DIR%" "%TARGET_DIR%"
     set EXITCODE=!ERRORLEVEL!
     if !EXITCODE! NEQ 0 (
